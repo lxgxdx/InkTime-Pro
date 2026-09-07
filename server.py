@@ -422,19 +422,47 @@ def _make_image_url(path_str: str) -> str:
 # --------------------------
 
 
-def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", sort: str = "memory"):
-    """分页读取 review 数据。支持按 MM-DD 过滤与排序。返回 (rows, total_count)."""
-    if not DB_PATH.exists():
-        raise SystemExit(f"找不到数据库文件: {DB_PATH}")
+def ensure_review_table():
+    """确保 photo_scores 表存在（第一次打开网页时自动建表，避免 no such table）。
 
+    复用 analyze_photos.ensure_table 的逻辑；analyze 尚未跑过时，网页也能打开（空状态）。
+    """
+    try:
+        import analyze_photos
+        conn = sqlite3.connect(DB_PATH)
+        analyze_photos.ensure_table(conn)
+        conn.close()
+    except Exception as e:
+        print(f"[review] 建表失败（不影响浏览，仅提示）：{e}")
+
+
+def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", sort: str = "memory"):
+    """分页读取 review 数据。支持按 MM-DD 过滤与排序。返回 (rows, total_count)。
+
+    数据库不存在 / 表不存在 / 空库时，都返回空列表，让网页显示"还没有照片"，而不是报错 500。
+    """
     if page < 1:
         page = 1
     if page_size < 1:
         page_size = REVIEW_PAGE_SIZE
 
-    offset = (page - 1) * page_size
+    # 文件不存在 → 先建表，然后走空库路径
+    if not DB_PATH.exists():
+        ensure_review_table()
 
-    conn = sqlite3.connect(DB_PATH)
+    # 表不一定存在（analyze 未跑过）。做一个轻量探测，失败则按空库返回。
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        # 探测表是否存在
+        conn.execute("SELECT 1 FROM photo_scores LIMIT 1")
+    except sqlite3.OperationalError:
+        # no such table 等 → 按空库处理，报个提示
+        print("[review] photo_scores 表尚不存在，按空库返回（运行 analyze 后会有内容）")
+        return [], 0
+    except Exception as e:
+        print(f"[review] 读取数据库失败：{e}")
+        return [], 0
+
     c = conn.cursor()
 
     # 从 exif_json 里提取 datetime，再拼 MM-DD
@@ -2843,6 +2871,13 @@ if __name__ == "__main__":
     print(f"[InkTime] key: {DOWNLOAD_KEY}")
     print(f"[InkTime] listen: {FLASK_HOST}:{FLASK_PORT}")
     print(f"[InkTime] open: http://127.0.0.1:{FLASK_PORT}/  (本机)")
+
+    # 首次打开自动建表（photos.db + photo_scores），避免 /review 报 no such table
+    try:
+        ensure_review_table()
+        print(f"[InkTime] 数据库表已就绪（photos.db）")
+    except Exception as e:
+        print(f"[InkTime] 数据库初始化失败（继续运行）：{e}")
 
     # 应用 Web 设置 + 启动后台调度器（定时扫描/渲染）
     try:
