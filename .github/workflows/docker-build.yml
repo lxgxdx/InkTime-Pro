@@ -1,0 +1,55 @@
+name: 构建 Docker 镜像
+
+# 触发条件：
+#   - push 到 master 分支（每次更新软件都自动重新构建，方便 NAS 增量升级）
+#   - 打版本 tag（如 v0.2.0）也构建，并存成带版本的镜像
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]
+  workflow_dispatch: {}   # 允许手动触发（GitHub 网页 Actions 里点按钮）
+
+env:
+  IMAGE_NAME: inktime-pro
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # 允许推送镜像到 GHCR
+
+    steps:
+      # 1) 检出代码
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 2) 登录 GitHub Container Registry
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 3) 准备镜像元数据（latest + tag 名 + sha 前缀）
+      - name: 提取镜像元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch      # master → latest
+            type=semver,pattern={{version}}   # tag v0.2.0 → 0.2.0
+            type=sha,prefix=            # 每次提交 → <短sha>
+
+      # 4) 构建并推送镜像（带 buildx 多架构缓存）
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

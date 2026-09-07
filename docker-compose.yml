@@ -22,7 +22,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: inktime:latest          # ← 用镜像升级就改成 ghcr.io/<用户名>/inktime:latest
+    # 用 GitHub Actions 自动构建的镜像（推荐，升级只需 pull）：
+    image: ghcr.io/lxgxdx/inktime-pro:latest
+    # 若想本地构建（不拉远程镜像），把上面 image 改成 inktime:latest 并给 build 加注释即可
     container_name: inktime
     restart: unless-stopped
 
