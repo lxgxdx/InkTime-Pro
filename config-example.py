@@ -8,22 +8,31 @@ IMAGE_DIR = os.environ.get("INKTIME_IMAGE_DIR", "./test")
 # Docker 部署时可覆盖：INKTIME_DB_PATH
 DB_PATH = os.environ.get("INKTIME_DB_PATH", "./photos.db")
 
-# VLM 渠道列表（按优先级从高到低排列）
-# 当某个渠道返回 429 时，自动尝试下一个渠道
-# 示例：MiniMax-M3（OpenAI 兼容接口，支持 image_url+base64 图片输入）
-# api_key 建议从环境变量读（Docker：MINIMAX_API_KEY），不要在源码里写死
+# VLM 多渠道（OpenAI 兼容视觉），按优先级自动降级（某家 429/失败自动切下一家）
+# 注意：api.minimax.io 在本机旁路由下连不上；api.minimaxi.com 可达（2026-09-06 实测）。
+# 重要：API_CHANNELS 条目数固定（3 条），运行时只改 api_key/enabled，勿删减（concatenate 数组长度定死）。
 API_CHANNELS = [
     {
-        "api_url":    "https://api.minimax.io/v1/chat/completions",
+        "provider":   "minimax",
+        "api_url":    "https://api.minimaxi.com/v1/chat/completions",
         "api_key":    os.environ.get("MINIMAX_API_KEY", ""),
         "model_name": "MiniMax-M3",
+        "enabled":    True,
     },
-    # 可以添加更多渠道（自动降级），例如本地 LM Studio / 其它 OpenAI 兼容服务：
-    # {
-    #     "api_url":    "http://127.0.0.1:1234/v1/chat/completions",
-    #     "api_key":    "",
-    #     "model_name": "qwen3-vl-32b-instruct",
-    # },
+    {
+        "provider":   "zhipu",
+        "api_url":    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        "api_key":    os.environ.get("ZHIPU_API_KEY", ""),
+        "model_name": "glm-4.6v",
+        "enabled":    True,
+    },
+    {
+        "provider":   "deepseek",
+        "api_url":    "https://api.deepseek.com/chat/completions",
+        "api_key":    os.environ.get("DEEPSEEK_API_KEY", ""),
+        "model_name": "deepseek-v4-flash-vision-exp",
+        "enabled":    True,
+    },
 ]
 
 # 每次最多处理多少张的图片
@@ -37,8 +46,11 @@ TIMEOUT = 600
 CHANNEL_FAILOVER_COOLDOWN_SEC = 300
 
 # 为防止照片隐私泄露，建议为 ESP32 下载路径加一个随机前缀作为密钥
-# 前缀修改后，请同步修改 esp32/ink-display-7C-photo/ink-display-7C-photo.ino 固件中的 DAILY_PHOTO_PATH_PREFIX 字段）
-DOWNLOAD_KEY = "yourdownloadkey"
+# 前缀修改后，请同步修改 ESP32 固件中的 DAILY_PHOTO_PATH_PREFIX 字段
+DOWNLOAD_KEY = "inktime_local_test"
+
+# 成品目录：存"各启用屏预裁切好的基图"（analyze 时写，render 复用）
+CONVERTED_DIR = os.environ.get("INKTIME_CONVERTED_DIR", "./converted")
 
 # Flask 静态服务
 FLASK_HOST = "0.0.0.0"
@@ -77,6 +89,19 @@ DAILY_PHOTO_QUANTITY = 5
 
 # 发送给 VLM 之前，先把图片长边缩放到该值（像素）。MiniMax 建议 512，省 token/成本。
 VLM_MAX_LONG_EDGE = 512
+
+# 无意义照片判定：memory_score 低于该值则视为"无意义"，跳过旁白与成品生成
+UNMEANINGFUL_THRESHOLD = float(os.environ.get("INKTIME_UNMEANINGFUL_THRESHOLD", 40.0))
+
+# ========== 5小时窗口对齐的 Token 感知调度参数（可选）==========
+# MiniMax 套餐额度是"5 小时一清、用不完浪费"。深夜空闲自动多扫照片把额度用掉。
+IDLE_WINDOW_START = os.environ.get("INKTIME_IDLE_START", "23:00")   # 空闲时段起点（深夜）
+IDLE_WINDOW_END = os.environ.get("INKTIME_IDLE_END", "07:00")       # 空闲时段终点
+QUOTA_SCHEDULE_ENABLED = os.environ.get("INKTIME_QUOTA_SCHEDULE", "1") not in ("0", "false", "False")
+QUOTA_EDGE_MIN = float(os.environ.get("INKTIME_QUOTA_EDGE_MIN", 30))      # 窗口剩 <N 分钟触发
+QUOTA_PER_RUN_BATCH_LIMIT = int(os.environ.get("INKTIME_QUOTA_BATCH_LIMIT", 20))  # 每次限量
+QUOTA_FIRE_COOLDOWN_SEC = int(os.environ.get("INKTIME_QUOTA_COOLDOWN", 1800))     # 冷却
+QUOTA_IDLE_PERCENT = float(os.environ.get("INKTIME_QUOTA_IDLE_PERCENT", 5.0))     # 空闲余量>N%才烧
 
 # ========== 屏幕配置（多分辨率并存）==========
 # SCREENS 是列表：一次可为多块屏（不同尺寸/分辨率/颜色）同时出成品。
