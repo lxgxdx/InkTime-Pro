@@ -37,6 +37,9 @@ services:
       - TZ=Asia/Shanghai
       # ↓↓↓ 换成你的 MiniMax API key（打分管线用）
       - MINIMAX_API_KEY=your-minimax-key-here
+      # 数据目录的宿主机所有用户/组（Unraid 标准值 99:100=nobody:users；改成你 appdata 的实际属主）
+      - PUID=99
+      - PGID=100
       # server 绑定（一般保持默认）
       - FLASK_HOST=0.0.0.0
       - FLASK_PORT=8765

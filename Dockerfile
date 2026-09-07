@@ -2,11 +2,11 @@
 # 基础：python:3.11-slim（稳定且依赖兼容）
 FROM python:3.11-slim
 
-# 中文时区 + cron + exiftool（读GPS/EXIF）+ libraw（RAW解码）+ 中文字体
+# 中文时区 + exiftool（读GPS/EXIF）+ libraw（RAW解码）+ 中文字体 + gosu（PUID/PGID 切用户）
 # rawpy 依赖 libraw* 系统库解 RAW 相机格式；exiftool 读完整 GPS
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        tzdata cron libimage-exiftool-perl fonts-noto-cjk \
-        libraw23 libraw-bin \
+        tzdata libimage-exiftool-perl fonts-noto-cjk \
+        libraw23 libraw-bin gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # 时区（compose 可覆盖，这里给东八区默认）
@@ -27,11 +27,14 @@ COPY analyze_photos.py render_daily_photo.py server.py \
 # config.py 不存在时用模板兜底一份（不含真实密钥，运行时挂载覆盖）
 RUN cp config-example.py config.py || true
 
-# 数据/输出/日志目录（挂载点）
+# 数据/输出/日志目录（挂载点；实际所有者为 entrypoint 里按 PUID/PGID 定的用户）
 RUN mkdir -p /app/data /app/photos /app/logs /app/output /app/data/converted
 
-# 运行时环境变量（compose 可覆盖）
-ENV INKTIME_IMAGE_DIR=/app/photos \
+# PUID / PGID：Unraid 标准的宿主机用户ID映射（默认 99:100 = Unraid 的 root:users 常见值）
+# 容器内按这两个值创建一个 user 运行，从而对挂载的 /mnt/user/... 目录有正确写权限。
+ENV PUID=99 \
+    PGID=100 \
+    INKTIME_IMAGE_DIR=/app/photos \
     INKTIME_DB_PATH=/app/data/photos.db \
     INKTIME_BIN_OUTPUT_DIR=/app/data/output \
     INKTIME_CONVERTED_DIR=/app/data/converted \
@@ -40,14 +43,8 @@ ENV INKTIME_IMAGE_DIR=/app/photos \
     FLASK_HOST=0.0.0.0 \
     FLASK_PORT=8765
 
-# 非 root 运行（更安全；数据目录挂载到 host 时注意权限）
-RUN useradd -m -u 1000 inktime \
-    && mkdir -p /app/data /app/photos /app/logs /app/output /app/data/converted \
-    && chown -R inktime:inktime /app
-USER inktime
-
-# 入口脚本：启动 server（含后台调度）+ 可选容器 cron 兜底
-COPY --chown=inktime:inktime docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+# 入口脚本：启动 server（含后台调度）。entrypoint 负责按 PUID/PGID 建用户并降权运行。
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 8765
@@ -57,5 +54,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import socket; socket.create_connection(('127.0.0.1',8765), timeout=4).close(); raise SystemExit(0)" \
         || python -c "import socket,sys; sys.exit(1)"
 
-# 入口（容器是 cron+server 常驻，所以前台跑 entrypoint）
-CMD ["docker-entrypoint.sh"]
+# 入口：以 root 跑 entrypoint（内部切 PUID/PGID）。
+# 用 exec /entrypoint 而不是直接 docker-entrypoint.sh，保证信号转发。
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
