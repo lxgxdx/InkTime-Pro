@@ -1,0 +1,22 @@
+# 秘钥 / 数据（不要提交）
+config.py
+.env
+photos.db
+filelist.txt
+web_settings.json
+web_settings.json.tmp
+test/
+output/
+converted/
+logs/
+data/*.db
+__pycache__/
+*.pyc
+
+# 运行日志
+*.log
+*.log.*
+
+# 示例模板保留
+!config-example.py
+!.env.example

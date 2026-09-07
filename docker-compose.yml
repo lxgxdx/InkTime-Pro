@@ -1,0 +1,55 @@
+# InkTime 服务器 Docker Compose（Unraid / 任意 Compose 兼容主机）
+#
+# 两种用法（任选）：
+#   A) 从 GitHub 拉预构建镜像（推荐，升级最方便）：
+#       1) 把本文件放到 NAS 的 Compose 目录
+#       2) 改 image 为你的镜像（如 ghcr.io/你的用户名/inktime:latest）
+#       3) docker compose up -d   （会 pull 镜像并启动）
+#       4) 之后升级 = docker compose pull && docker compose up -d
+#   B) 本地构建：
+#       1) git clone 本仓库到 NAS
+#       2) docker compose up -d --build
+#       3) 之后升级 = git pull && docker compose up -d --build
+#
+# 无论哪种，照片/数据都放在挂载卷里，升级不会丢。
+# 首次需：
+#   - 把照片映射进容器（改 volumes 的 /mnt/user/photos）
+#   - 手动跑一遍打分： docker exec inktime python analyze_photos.py
+
+services:
+  inktime:
+    # —— 镜像：改这三处 ——
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: inktime:latest          # ← 用镜像升级就改成 ghcr.io/<用户名>/inktime:latest
+    container_name: inktime
+    restart: unless-stopped
+
+    # 端口：server.py 的 Flask（ESP32 下载 .bin + WebUI）
+    ports:
+      - "8765:8765"
+
+    # 时区（决定每日选片更新时间）
+    environment:
+      - TZ=Asia/Shanghai
+      # ↓↓↓ 换成你的 MiniMax API key（打分管线用）
+      - MINIMAX_API_KEY=your-minimax-key-here
+      # server 绑定（一般保持默认）
+      - FLASK_HOST=0.0.0.0
+      - FLASK_PORT=8765
+
+    # 挂载：照片 / 成品 / 数据(DB+输出) / 配置 / 字体
+    volumes:
+      # 你的相册目录（改左边为 NAS 上真实照片路径）—— 原图路径
+      - /mnt/user/photos:/app/photos
+      # 成品目录（改左边为 NAS 上成品路径）—— 已裁切好的各分辨率基图
+      - /mnt/user/inktime_converted:/app/data/converted
+      # 数据持久化：photos.db + 渲染出的 .bin + 预览图 + 设置
+      - ./data:/app/data
+      # 日志
+      - ./logs:/app/logs
+      # 配置：把 config-example.py 复制为 config.py 并改，再挂载覆盖
+      - ./config.py:/app/config.py:ro
+      # 可选：自定义字体
+      # - ./fonts:/app/fonts
