@@ -240,7 +240,11 @@ class Scheduler:
                 }
                 for j in self.jobs
             ]
-        return {"jobs": jobs, "quota": self._quota_status}
+        return {
+            "jobs": jobs,
+            "quota": self._quota_status,
+            "scan_running": self.is_analyze_running(),
+        }
 
     def _spawn(self, job: dict, now: datetime) -> None:
         """拉起 job 子进程（非阻塞）。analyze 走 token 门控 + 冷却 + batch_limit 注入。"""
@@ -286,6 +290,71 @@ class Scheduler:
             self._proc[name] = proc
             if job.get("quota_gated"):
                 self._cooldown_until[name] = time.monotonic() + QUOTA_FIRE_COOLDOWN_SEC
+
+    # ---------- 手动控制（网页按钮） ----------
+
+    def _get_job(self, name: str) -> dict | None:
+        with self._lock:
+            for j in self.jobs:
+                if j["name"] == name:
+                    return j
+        return None
+
+    def start_analyze_manual(self) -> tuple[bool, str]:
+        """网页点「开始扫描」：立即拉起 analyze（绕过 token 门控）。
+
+        遵守规则：已有一个 analyze 在跑则跳过；用 web_settings 的 batch_limit 限量。
+        """
+        job = self._get_job("analyze")
+        if job is None:
+            return False, "找不到 analyze 任务"
+        p = self._proc.get("analyze")
+        if p is not None and p.poll() is None:
+            return False, "正在扫描中，请稍候"
+
+        # 手动触发同样带 batch_limit（防止一次性扫太多）
+        env = dict(os.environ)
+        env["INKTIME_BATCH_LIMIT"] = str(QUOTA_PER_RUN_BATCH_LIMIT)
+        log_path = LOG_DIR / job["log"]
+        now = datetime.now()
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n[{now:%F %T}] [scheduler] 手动开始扫描\n")
+            proc = subprocess.Popen(
+                list(job["cmd"]),
+                cwd=str(ROOT_DIR),
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                env=env,
+            )
+        with self._lock:
+            self._proc["analyze"] = proc
+            # 下次自动触发推迟一点，避免刚手动跑完又自动跑
+            now2 = datetime.now()
+            for j in self.jobs:
+                if j["name"] == "analyze":
+                    j["next_run"] = now2 + timedelta(seconds=_SCHED_TICK_SEC)
+        print(f"[scheduler] 手动开始扫描，batch_limit={QUOTA_PER_RUN_BATCH_LIMIT}")
+        return True, "已开始扫描"
+
+    def stop_analyze_manual(self) -> tuple[bool, str]:
+        """网页点「停止扫描」：终止正在跑的 analyze 子进程。"""
+        p = self._proc.get("analyze")
+        if p is None or p.poll() is not None:
+            return False, "当前没有在扫描"
+        try:
+            p.terminate()   # 先温和终止
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()    # 5 秒内没停就强杀
+            print("[scheduler] 手动停止扫描")
+            return True, "已停止扫描"
+        except Exception as e:
+            return False, f"停止失败：{e}"
+
+    def is_analyze_running(self) -> bool:
+        p = self._proc.get("analyze")
+        return p is not None and p.poll() is None
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -2267,6 +2336,20 @@ def api_status():
         return Response(json.dumps({"error": str(e)}), mimetype="application/json")
 
 
+@app.post("/api/scan/start")
+def api_scan_start():
+    _require_webui_enabled()
+    ok, msg = scheduler.start_analyze_manual()
+    return Response(json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False), mimetype="application/json")
+
+
+@app.post("/api/scan/stop")
+def api_scan_stop():
+    _require_webui_enabled()
+    ok, msg = scheduler.stop_analyze_manual()
+    return Response(json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False), mimetype="application/json")
+
+
 @app.get("/api/quotas")
 def api_quotas():
     _require_webui_enabled()
@@ -2388,6 +2471,12 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 <div class="kv"><label>每日出图</label><input type="text" id="render_cron" placeholder="5 4 * * *" style="grid-column:1"><label style="display:flex;gap:6px"><input type="checkbox" id="render_enabled">开启</label><select id="render_preset" onchange="applyPreset('render')"></select></div>
 <div class="hint">⭐ 每个任务下方会实时显示成一句人话：<span id="analyze_hint" class="ok"></span></div>
 <div class="hint">⭐ 每日出图同样：<span id="render_hint" class="ok"></span></div>
+<div class="controls" style="margin:10px 0;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;">
+  <button type="button" id="scanStartBtn" class="primary" onclick="startScan()">▶ 现在扫描</button>
+  <button type="button" id="scanStopBtn" onclick="stopScan()">■ 停止扫描</button>
+  <span class="subtitle" id="scanMsg" style="margin:0"></span>
+</div>
+<div class="hint" style="margin-bottom:4px">「现在扫描」= 立刻按当前规则把相册里没打过分的新照片扫一遍（不受空闲时段限制）。</div>
 <div class="statusline" id="statusBox">尚未查看调度状态</div>
 </details>
 
@@ -2661,7 +2750,32 @@ async function refreshStatus(){
       lines.push('额度利用：'+gv);
     }
     box.innerHTML = lines.join('<br>');
+    // 根据是否在扫描，切换开始/停止按钮可用性
+    const running = !!st.scan_running;
+    const startBtn = document.getElementById('scanStartBtn');
+    const stopBtn = document.getElementById('scanStopBtn');
+    if(startBtn){ startBtn.disabled = running; startBtn.textContent = running ? '⏳ 扫描中…' : '▶ 现在扫描'; }
+    if(stopBtn){ stopBtn.disabled = !running; }
   }catch(e){ box.textContent = '查询失败: '+e; }
+}
+
+async function startScan(){
+  const msg = document.getElementById('scanMsg');
+  if(msg) msg.textContent = '正在启动…';
+  try{
+    const r = await getJSON('/api/scan/start', {method:'POST'});
+    if(msg) msg.textContent = r.ok ? '已开始 ✓' : (r.msg||'未开始');
+    refreshStatus();
+  }catch(e){ if(msg) msg.textContent = '启动失败: '+e; }
+}
+
+async function stopScan(){
+  const msg = document.getElementById('scanMsg');
+  try{
+    const r = await getJSON('/api/scan/stop', {method:'POST'});
+    if(msg) msg.textContent = r.ok ? '已停止 ✓' : (r.msg||'');
+    refreshStatus();
+  }catch(e){ if(msg) msg.textContent = '停止失败: '+e; }
 }
 
 initSettings();
