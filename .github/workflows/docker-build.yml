@@ -39,10 +39,10 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}   # 默认分支永远打 latest（NAS 增量升级用）
-            type=ref,event=branch,enable={{!is_default_branch}}  # 其它分支打分支名
-            type=semver,pattern={{version}}   # tag v0.2.0 → 0.2.0
-            type=sha,prefix=                  # 每次提交 → <短sha>
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}   # 主分支打 latest（NAS 增量升级用）
+            type=ref,event=branch            # 分支名标签
+            type=semver,pattern={{version}}  # tag v0.2.0 → 0.2.0
+            type=sha,prefix=                 # 每次提交 → <短sha>
 
       # 4) 启用 buildx 的 containerd 驱动（支持 GHA 缓存；默认 docker 驱动不支持）
       - name: 配置 buildx
