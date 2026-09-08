@@ -50,6 +50,68 @@ FONT_PATH = Path(str(getattr(cfg, "FONT_PATH", "") or "")).expanduser()
 if str(FONT_PATH) and not FONT_PATH.is_absolute():
     FONT_PATH = (ROOT_DIR / FONT_PATH).resolve()
 
+# ---- 中文字体自动探测（FONT_PATH 为空时用容器/本机内建 CJK，避免 load_default 无中文乱码） ----
+_FONT_PATH_CACHE = None   # None=未探测 / str=命中路径 / ""=探测完成但无可用中文字体
+
+def _resolve_cjk_font_path():
+    """按优先级找一个可用的中文字体文件，返回路径字符串或 None。结果缓存在模块级。
+
+    顺序：FONT_PATH(用户指定,须 is_file) → /app/fonts + ./fonts → 容器 NotoSansCJK(Reg/Bold)
+          → glob 容器 /usr/share/fonts/**/*CJK* → Windows msyh/msyhbd/simhei/simsun → DejaVu(拉丁兜底)。
+    注意用 is_file() 而非 exists()：FONT_PATH="" → Path("")=Path(".") 解析成目录，exists() 为 True 会误命中。
+    """
+    global _FONT_PATH_CACHE
+    if _FONT_PATH_CACHE is not None:
+        return _FONT_PATH_CACHE or None
+    cands: list[Path] = []
+    # 0) 用户显式 FONT_PATH（必须是文件）
+    if str(FONT_PATH) and FONT_PATH.is_file():
+        cands.append(FONT_PATH)
+    # 1) 用户挂载 /app/fonts + 仓库 ./fonts
+    for base in (Path("/app/fonts"), (ROOT_DIR / "fonts")):
+        try:
+            if base.is_dir():
+                cands += [p for p in sorted(base.iterdir()) if p.suffix.lower() in (".ttc", ".ttf", ".otf")]
+        except Exception:
+            pass
+    # 2) 容器 fonts-noto-cjk（Debian 落地路径）
+    cands += [Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+              Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc")]
+    # 3) glob 兜底发现其它 CJK
+    try:
+        for p in Path("/usr/share/fonts").rglob("*CJK*"):
+            if p.is_file() and p.suffix.lower() in (".ttc", ".ttf", ".otf"):
+                cands.append(p)
+    except Exception:
+        pass
+    # 4) Windows 本机
+    cands += [Path("C:/Windows/Fonts/msyh.ttc"), Path("C:/Windows/Fonts/msyhbd.ttc"),
+              Path("C:/Windows/Fonts/simhei.ttf"), Path("C:/Windows/Fonts/simsun.ttc")]
+    # 5) 拉丁兜底（无中文但比 load_default 干净，用于纯数字/日期/地名行）
+    cands += [Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")]
+    for p in cands:
+        if not p.is_file():
+            continue
+        try:
+            ImageFont.truetype(str(p), 14)   # 校验 Pillow 能打开（.ttc 取首个 face）
+            _FONT_PATH_CACHE = str(p)
+            return _FONT_PATH_CACHE
+        except Exception:
+            continue
+    _FONT_PATH_CACHE = ""
+    return None
+
+
+def _get_font(size):
+    """返回可用字体（优先 CJK，找不到回退 load_default）。"""
+    path = _resolve_cjk_font_path()
+    if path:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
 MEMORY_THRESHOLD = float(getattr(cfg, "MEMORY_THRESHOLD", 70.0) or 70.0)
 DAILY_PHOTO_QUANTITY = int(getattr(cfg, "DAILY_PHOTO_QUANTITY", 5) or 5)
 
@@ -462,7 +524,7 @@ def format_location(lat, lon, city: str) -> str:
         return ""
 
 
-def render_image(item: Dict[str, Any], screen: Optional[Dict[str, Any]] = None) -> Image.Image:
+def render_image(item: Dict[str, Any], screen: Optional[Dict[str, Any]] = None) -> Tuple[Image.Image, str]:
     """
     根据选中的 item 渲染一张 RGB 成品图（按照片方向自适应）：
     - **先解码原图一次**（load_image_any 已 exif_transpose），由 img.size 得真实显示方向。
@@ -510,12 +572,9 @@ def render_image(item: Dict[str, Any], screen: Optional[Dict[str, Any]] = None) 
     text_area_top = ch - ta + max(6, int(round(10 * ch / 800.0)))
     text_width = cw - 2 * padding_x
 
-    try:
-        font_big = ImageFont.truetype(str(FONT_PATH), 22)  # 文案
-        font_small = ImageFont.truetype(str(FONT_PATH), 20)  # 日期/地点
-    except Exception:
-        font_big = ImageFont.load_default()
-        font_small = ImageFont.load_default()
+    # 字体：FONT_PATH 为空时自动探测容器/本机 CJK 中文字体（否则 load_default 无中文乱码）
+    font_big = _get_font(22)     # 文案
+    font_small = _get_font(20)   # 日期/地点
 
     side_text = item.get("side") or ""
 

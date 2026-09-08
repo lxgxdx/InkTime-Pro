@@ -1761,6 +1761,8 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
       background:#fff;
       border: 1px solid rgba(255,255,255,0.18);
       border-radius: 10px;
+      max-width:100%;        /* 横向大图窄屏不溢出 */
+      height:auto;
     }}
 
     .meta-box {{
@@ -2377,10 +2379,10 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
 
       const img = new Image();
       img.onload = function() {{
-          canvas.width = {CANVAS_W};
-          canvas.height = {CANVAS_H};
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-          ctx.drawImage(img, 0, 0, {CANVAS_W}, {CANVAS_H});
+          // 按图片自然尺寸设 canvas（横照 800×480 / 竖照 480×800，跟随方向不再被拉伸竖框）
+          canvas.width = img.naturalWidth || img.width;
+          canvas.height = img.naturalHeight || img.height;
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         }};
       img.onerror = function() {{
         statusLine.textContent = '图片加载失败：' + photo.path;

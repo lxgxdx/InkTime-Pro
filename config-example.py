@@ -79,7 +79,11 @@ CITY_MAX_DISTANCE_KM = 100.0
 # Docker 部署时可覆盖：INKTIME_BIN_OUTPUT_DIR
 BIN_OUTPUT_DIR = os.environ.get("INKTIME_BIN_OUTPUT_DIR", "./output")
 
-# 自定义字体路径（为空则退回默认字体）
+# 自定义字体路径（可选）。留空则自动探测中文字体：
+#   容器内 /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc（镜像已装 fonts-noto-cjk）
+#   你挂载的 /app/fonts/*.ttf|*.ttc（docker-compose 已预留挂载点）
+#   本机 Windows C:/Windows/Fonts/msyh.ttc 等
+# 自动探测后基本无需配置此项。
 FONT_PATH = ""
 
 # 每日选片“精彩度”阈值（>75 才够格上每日一图）
