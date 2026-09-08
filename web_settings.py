@@ -94,17 +94,21 @@ def _default() -> dict:
             },
         ],
         "config": {
-            "MEMORY_THRESHOLD": 70.0,
+            "MEMORY_THRESHOLD": 75.0,
             "DAILY_PHOTO_QUANTITY": 5,
             "UNMEANINGFUL_THRESHOLD": 40.0,
+            "VLM_MAX_LONG_EDGE": 1024,
+            "HOME_MIN_SCORE": 60.0,
+            "HOME_HIDE_UNMEANINGFUL": True,
         },
         "quota": {
             "idle_start": "23:00",
             "idle_end": "07:00",
-            "edge_min": 30,
+            "edge_min": 35,
             "batch_limit": 20,
             "cooldown_sec": 1800,
-            "idle_percent": 5.0,
+            "floor_percent": 10.0,
+            "photo_burn_percent": 0.5,
             "enabled": True,
         },
     }
@@ -307,7 +311,9 @@ def apply_to_config(cfg) -> None:
             "edge_min": "QUOTA_EDGE_MIN",
             "batch_limit": "QUOTA_PER_RUN_BATCH_LIMIT",
             "cooldown_sec": "QUOTA_FIRE_COOLDOWN_SEC",
-            "idle_percent": "QUOTA_IDLE_PERCENT",
+            "floor_percent": "QUOTA_FLOOR_PERCENT",
+            "photo_burn_percent": "QUOTA_PERCENT_PER_PHOTO",
+            "idle_percent": "QUOTA_FLOOR_PERCENT",  # 旧键名兜底：本来语义是"余量>N%才动"，现作烧到剩N%底线
             "enabled": "QUOTA_SCHEDULE_ENABLED",
         }
         for k, v in quota.items():

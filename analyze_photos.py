@@ -261,7 +261,7 @@ else:
 # 发送给 VLM 之前，先把图片长边缩放到该值（像素）。
 # 0 表示不缩放。
 # 本地推理可保持较高值；云端推理建议降低（减少 token/成本）。
-VLM_MAX_LONG_EDGE = int(getattr(cfg, "VLM_MAX_LONG_EDGE", 2560) or 2560)
+VLM_MAX_LONG_EDGE = int(getattr(cfg, "VLM_MAX_LONG_EDGE", 1024) or 1024)
 
 # 中文城市数据库位置
 WORLD_CITIES_CSV = Path(str(getattr(cfg, "WORLD_CITIES_CSV", "data/world_cities_zh.csv") or "data/world_cities_zh.csv")).expanduser()
@@ -1420,7 +1420,7 @@ def main():
         print(f"[WARN] 应用 web_settings 失败：{_e}，仍按 config.py 运行")
 
     # 重新读启用屏列表 + 无意义阈值（设置页可能改了 SCREENS / CONVERTED_DIR / UNMEANINGFUL）
-    global SCREENS, SCREENS_ENABLED, CONVERTED_DIR, UNMEANINGFUL_THRESHOLD
+    global SCREENS, SCREENS_ENABLED, CONVERTED_DIR, UNMEANINGFUL_THRESHOLD, VLM_MAX_LONG_EDGE
     _sr = getattr(cfg, "SCREENS", None) or getattr(cfg, "SCREEN", None) or {}
     SCREENS = [_sr] if isinstance(_sr, dict) else [x for x in _sr if isinstance(x, dict)]
     SCREENS_ENABLED = [
@@ -1429,6 +1429,7 @@ def main():
     _cd = Path(str(getattr(cfg, "CONVERTED_DIR", "./converted") or "./converted")).expanduser()
     CONVERTED_DIR = _cd.resolve() if _cd.is_absolute() else (ROOT_DIR / _cd).resolve()
     UNMEANINGFUL_THRESHOLD = float(getattr(cfg, "UNMEANINGFUL_THRESHOLD", 40.0) or 40.0)
+    VLM_MAX_LONG_EDGE = int(getattr(cfg, "VLM_MAX_LONG_EDGE", 1024) or 1024)  # encode_image_to_b64 用，不同步就永远用旧值
     if SCREENS_ENABLED:
         print(f"[INFO] 启用成品屏：{[s.get('name') for s in SCREENS_ENABLED]}")
 

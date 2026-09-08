@@ -260,7 +260,8 @@ def choose_photo_for_today(items: List[Dict[str, Any]], today: dt.date) -> Tuple
         arr = by_md.get(md, [])
         if not arr:
             continue
-        candidates = [p for p in arr if p.get("memory", -1.0) > MEMORY_THRESHOLD]
+        # 候选：回忆度达标 且 非无意义（AI/阈值判定的 meaningful=0 不进每日一图）
+        candidates = [p for p in arr if p.get("memory", -1.0) > MEMORY_THRESHOLD and p.get("is_meaningful", 1) != 0]
         if not candidates:
             continue
 
@@ -325,7 +326,8 @@ def choose_photos_for_today(items: List[Dict[str, Any]], today: dt.date, count: 
         arr = by_md.get(md, [])
         if not arr:
             continue
-        candidates = [p for p in arr if p.get("memory", -1.0) > MEMORY_THRESHOLD]
+        # 候选：回忆度达标 且 非无意义（AI/阈值判定的 meaningful=0 不进每日一图）
+        candidates = [p for p in arr if p.get("memory", -1.0) > MEMORY_THRESHOLD and p.get("is_meaningful", 1) != 0]
         if not candidates:
             continue
 
@@ -353,8 +355,11 @@ def choose_photos_for_today(items: List[Dict[str, Any]], today: dt.date, count: 
         }
         return chosen_list, info
 
-    # 兜底：全局回忆度最高的若干张
-    sorted_all = sorted(items, key=lambda x: x.get("memory", -1.0), reverse=True)
+    # 兜底：全局回忆度最高的若干张（同样排除无意义）；若全部无意义，则退化为不过滤（只要有图可显示）
+    meaningful_items = [x for x in items if x.get("is_meaningful", 1) != 0]
+    if not meaningful_items:
+        meaningful_items = items
+    sorted_all = sorted(meaningful_items, key=lambda x: x.get("memory", -1.0), reverse=True)
     chosen_list = sorted_all[:count]
     info = {
         "target_md": target_md,

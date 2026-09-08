@@ -2569,6 +2569,11 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 .kv{display:grid;grid-template-columns:180px 1fr auto;gap:10px;align-items:center;margin-bottom:10px;font-size:14px}
 .kv label{color:var(--muted)}
 .kv input[type=text],.kv input[type=password]{width:100%}
+/* cron 常用档位按钮组 */
+.cron-chips{display:flex;flex-wrap:wrap;gap:6px;margin:-4px 0 12px 190px}
+.cron-chips .chip{background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:16px;padding:5px 12px;font-size:12px;cursor:pointer}
+.cron-chips .chip:hover{background:var(--line)}
+.cron-chips .chip.active{background:var(--accent);color:#0b0c10;font-weight:600;border-color:var(--accent)}
 .hint{color:var(--muted);font-size:12px;margin-bottom:14px}
 #quotaBox,.statusline{font-family:ui-monospace,Consolas,monospace;font-size:13px;line-height:1.6;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px;}
 .ok{color:var(--accent2)} .warn{color:#ffd479} .err{color:#ff7b7b}
@@ -2610,8 +2615,10 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 <details class="fold" open>
 <summary>自动任务（新增照片 / 每日出图）</summary>
 <div class="hint">下面两件事会自动跑：<b>①扫描新照片</b>＝把相册里没打过分的新照片送去打分、写文案；<b>②每日出图</b>＝每天挑一张「历史上的今天」渲染成墨水屏能显示的图片。填「分 时 日 月 周」五个数字，看不懂没关系，选右边的常用档位会自动帮你填。</div>
-<div class="kv"><label>扫描新照片</label><input type="text" id="analyze_cron" placeholder="30 3 * * *" style="grid-column:1"><label style="display:flex;gap:6px"><input type="checkbox" id="analyze_enabled">开启</label><select id="analyze_preset" onchange="applyPreset('analyze')"></select></div>
-<div class="kv"><label>每日出图</label><input type="text" id="render_cron" placeholder="5 4 * * *" style="grid-column:1"><label style="display:flex;gap:6px"><input type="checkbox" id="render_enabled">开启</label><select id="render_preset" onchange="applyPreset('render')"></select></div>
+<div class="kv"><label>扫描新照片</label><input type="text" id="analyze_cron" placeholder="30 3 * * *" style="grid-column:1"><label style="display:flex;gap:6px"><input type="checkbox" id="analyze_enabled">开启</label></div>
+<div class="cron-chips" id="analyze_chips"></div>
+<div class="kv"><label>每日出图</label><input type="text" id="render_cron" placeholder="5 4 * * *" style="grid-column:1"><label style="display:flex;gap:6px"><input type="checkbox" id="render_enabled">开启</label></div>
+<div class="cron-chips" id="render_chips"></div>
 <div class="hint">⭐ 每个任务下方会实时显示成一句人话：<span id="analyze_hint" class="ok"></span></div>
 <div class="hint">⭐ 每日出图同样：<span id="render_hint" class="ok"></span></div>
 <div class="controls" style="margin:10px 0;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;">
@@ -2641,18 +2648,30 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 <div class="kv"><label>每天出几张图</label><input type="text" id="daily_qty"></div>
 <div class="kv"><label>没意义照片阈值</label><input type="text" id="unmeaningful_threshold"></div>
 <div class="hint">▲ 低于这个分的（比如截图、收据、杂物）会被标记为"没意义"，不配文案、不生成成品，省流量。</div>
+<div class="kv"><label>上传分辨率（长边px）</label><input type="range" id="vlm_max_long_edge" min="512" max="2048" step="128" value="1024"><span class="q-note" id="vlm_res_note">1024px</span></div>
+<div class="hint">▲ 发给大模型看图的清晰度。越大评分越准但越费流量；512 省流量，1024 更清晰（默认）。</div>
+<div class="kv"><label>主页显示最低分</label><input type="text" id="home_min_score" placeholder="60"></div>
+<div class="hint">▲ 低于这个回忆度的照片默认不在主页显示。勾"显示低分"才能看到它们。</div>
+<div class="kv"><label>主页隐藏无意义</label><label style="display:flex;gap:6px"><input type="checkbox" id="home_hide_unmeaningful">隐藏</label></div>
+<div class="hint">▲ 勾选后，被 AI 判定为"无意义"（截图/收据/杂物）的照片也不在主页显示。</div>
 </details>
 
 <details class="fold">
 <summary>额度自动利用（把快用完的额度用在半夜）</summary>
 <div class="hint">MiniMax 的套餐额度是「5 小时一清、用不完就浪费」。开启后，会在你基本不用手机的深夜时段自动多扫一些照片，把快要清零的额度用掉，不浪费钱。白天不会打扰你。</div>
-<div class="kv"><label>自动利用</label><input type="text" id="quota_idle_start" placeholder="23:00"><label style="display:flex;gap:6px"><input type="checkbox" id="quota_enabled">开启</label></div>
-<div class="kv"><label>利用时段：从</label><input type="text" id="quota_idle_end" placeholder="07:00" style="grid-column:1"></div>
-<div class="hint">▲ 上面两个数字是"深夜空闲"的起止时间，默认 23:00 → 07:00。只在这个时段自动跑扫描。</div>
-<div class="kv"><label>窗口剩多少分钟才提醒</label><input type="text" id="quota_edge_min" placeholder="30"><span class="q-note">分钟</span></div>
+<div class="kv"><label>自动利用</label><label style="display:flex;gap:6px"><input type="checkbox" id="quota_enabled">开启</label></div>
+<div class="kv"><label>深夜时段：从</label><input type="text" id="quota_idle_start" placeholder="23:00"></div>
+<div class="kv"><label>到</label><input type="text" id="quota_idle_end" placeholder="07:00"></div>
+<div class="hint">▲ 深夜空闲时段起止（默认 23:00 → 07:00）。这段时间会尽量多扫照片把额度用掉。</div>
+<div class="kv"><label>窗口剩多少分钟开始烧</label><input type="text" id="quota_edge_min" placeholder="35"><span class="q-note">分钟</span></div>
+<div class="hint">▲ 非深夜时，距 5h 窗口清零还剩这么多分钟就自动开始烧额度（用完的额度会被系统清零，不烧就浪费）。</div>
+<div class="kv"><label>烧到剩多少%就停</label><input type="text" id="quota_floor_percent" placeholder="10"><span class="q-note">%</span></div>
+<div class="hint">▲ 应急底线：额度烧到剩这么多 % 就停下，留着备用（建议 10）。</div>
 <div class="kv"><label>每次最多扫几张</label><input type="text" id="quota_batch_limit" placeholder="20"><span class="q-note">张</span></div>
+<div class="hint">▲ 单次自动扫描的上限，防止一次花太多。额度多时会自动多扫几轮。</div>
+<div class="kv"><label>每张约烧多少%额度</label><input type="text" id="quota_photo_burn" placeholder="0.5"><span class="q-note">%</span></div>
+<div class="hint">▲ 估算用：每张照片大约消耗窗口额度的多少%。用来算"这次该扫几张"。首次跑后看余额降幅可微调。</div>
 <div class="kv"><label>两次之间隔多久</label><input type="text" id="quota_cooldown" placeholder="1800"><span class="q-note">秒</span></div>
-<div class="kv"><label>余量超过多少%才动用</label><input type="text" id="quota_idle_percent" placeholder="5"><span class="q-note">%</span></div>
 </details>
 
 <div class="controls">
@@ -2672,21 +2691,23 @@ function setVal(id, v){
 }
 function setChk(id, v){ const el=document.getElementById(id); if(el) el.checked=!!v; }
 
-// —— cron 表达式 → 中文人话（外行人友好） ——
-const CRON_PRESETS = {
-  '0 3 * * *':   '每天凌晨 03:00',
-  '30 3 * * *':  '每天凌晨 03:30',
-  '0 6 * * *':   '每天清晨 06:00',
-  '0 9 * * *':   '每天早上 09:00',
-  '0 12 * * *':  '每天中午 12:00',
-  '0 */6 * * *': '每天每隔 6 小时',
-  '0 4 * * 1':   '每周一凌晨 04:00',
-  '0 5 * * *':   '每天凌晨 05:00',
-};
+// —— cron 常用档位（按钮组，点选即填；含每天/每周/每月） ——
+const CRON_PRESETS = [
+  {cron:'30 3 * * *', label:'每天凌晨 03:30'},
+  {cron:'0 3 * * *',  label:'每天凌晨 03:00'},
+  {cron:'0 6 * * *',  label:'每天清晨 06:00'},
+  {cron:'0 9 * * *',  label:'每天早上 09:00'},
+  {cron:'0 12 * * *', label:'每天中午 12:00'},
+  {cron:'0 4 * * 1',  label:'每周一凌晨 04:00'},
+  {cron:'0 4 * * 0',  label:'每周日凌晨 04:00'},
+  {cron:'0 4 1 * *',  label:'每月 1 号凌晨 04:00'},
+  {cron:'0 4 1,15 * *', label:'每月 1、15 号凌晨 04:00'},
+];
 function cronToChinese(cronStr){
   const c = (cronStr||'').trim();
   if(!c) return '（未设置）';
-  if(CRON_PRESETS[c]) return CRON_PRESETS[c];
+  // 先查档位表（精确命中直接返回人话）
+  for(const p of CRON_PRESETS){ if(p.cron === c) return p.label; }
   const p = c.split(' ');
   if(p.length < 5) return '『'+c+'』（请检查填写）';
   const [min, hour, dom, mon, dow] = p;
@@ -2695,6 +2716,11 @@ function cronToChinese(cronStr){
     const wk = {0:'周日',1:'周一',2:'周二',3:'周三',4:'周四',5:'周五',6:'周六'};
     const w = wk[+dow.replace('*/','')] || dow;
     h = '每' + w;
+  } else if(dom && dom !== '*') {
+    // 每月特定日（含逗号多日期）；hour/min 拼进去
+    const hm = (hour==='*') ? ('第 '+min+' 分') : (hour+' 点 '+min+' 分');
+    const days = dom.split(',').map(d=>d.trim()).join('、');
+    h = '每个月 ' + days + ' 号 ' + hm;
   } else if(hour === '*/6' && min === '0') {
     h = '每天每隔 6 小时';
   } else if(hour === '*/2' && min === '0') {
@@ -2712,24 +2738,34 @@ function refreshCronHint(prefix){
   const hintEl = document.getElementById(prefix+'_hint');
   if(cronInput && hintEl) hintEl.textContent = cronToChinese(cronInput.value);
 }
-function fillPresetSelect(prefix){
-  const sel = document.getElementById(prefix+'_preset');
-  if(!sel) return;
-  sel.innerHTML = '<option value="">常用档位▼</option>';
-  for(const [cron,label] of Object.entries(CRON_PRESETS)){
-    const o = document.createElement('option');
-    o.value = cron; o.textContent = label;
-    sel.appendChild(o);
+// 把常用档位渲染成可点选的按钮组（点一下自动填 cron，更直观）
+function renderCronChips(prefix){
+  const box = document.getElementById(prefix+'_chips');
+  if(!box) return;
+  box.innerHTML = '';
+  for(const p of CRON_PRESETS){
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'chip';
+    b.dataset.cron = p.cron;
+    b.textContent = p.label;
+    b.onclick = () => {
+      const cronInput = document.getElementById(prefix+'_cron');
+      if(cronInput){ cronInput.value = p.cron; }
+      // 高亮当前选中
+      box.querySelectorAll('button').forEach(x=>x.classList.remove('active'));
+      b.classList.add('active');
+      refreshCronHint(prefix);
+    };
+    box.appendChild(b);
   }
-}
-function applyPreset(prefix){
-  const sel = document.getElementById(prefix+'_preset');
+  // 根据现有 cron 值高亮匹配档位
   const cronInput = document.getElementById(prefix+'_cron');
-  if(sel && sel.value && cronInput){
-    cronInput.value = sel.value;
-    refreshCronHint(prefix);
+  if(cronInput && cronInput.value){
+    box.querySelectorAll('button').forEach(b=>{
+      b.classList.toggle('active', b.dataset.cron === cronInput.value);
+    });
   }
-  if(sel) sel.value = '';
 }
 
 async function initSettings(){
@@ -2742,7 +2778,7 @@ async function initSettings(){
     const sc = s.schedule || {};
     setVal('analyze_cron', sc.analyze_cron); setChk('analyze_enabled', sc.analyze_enabled);
     setVal('render_cron', sc.render_cron);   setChk('render_enabled', sc.render_enabled);
-    fillPresetSelect('analyze'); fillPresetSelect('render');
+    renderCronChips('analyze'); renderCronChips('render');
     refreshCronHint('analyze'); refreshCronHint('render');
     ['analyze_cron','render_cron'].forEach(id => {
       const el = document.getElementById(id);
@@ -2755,11 +2791,23 @@ async function initSettings(){
     const q = s.quota || {};
     setVal('quota_idle_start', q.idle_start); setVal('quota_idle_end', q.idle_end);
     setVal('quota_edge_min', q.edge_min); setVal('quota_batch_limit', q.batch_limit);
-    setVal('quota_cooldown', q.cooldown_sec); setVal('quota_idle_percent', q.idle_percent);
+    setVal('quota_cooldown', q.cooldown_sec);
+    setVal('quota_floor_percent', (q.floor_percent!==undefined?q.floor_percent:q.idle_percent) || 10);
+    setVal('quota_photo_burn', q.photo_burn_percent || 0.5);
     setChk('quota_enabled', q.enabled);
     const c = s.config || {};
     setVal('memory_threshold', c.MEMORY_THRESHOLD); setVal('daily_qty', c.DAILY_PHOTO_QUANTITY);
     setVal('unmeaningful_threshold', c.UNMEANINGFUL_THRESHOLD);
+    setVal('vlm_max_long_edge', c.VLM_MAX_LONG_EDGE || 1024);
+    setVal('home_min_score', c.HOME_MIN_SCORE || 60); setChk('home_hide_unmeaningful', c.HOME_HIDE_UNMEANINGFUL);
+    if(document.getElementById('vlm_res_note')) document.getElementById('vlm_res_note').textContent = (c.VLM_MAX_LONG_EDGE||1024)+'px';
+    // 上传分辨率滑块拖动时同步显示值
+    const vlmEl = document.getElementById('vlm_max_long_edge');
+    if(vlmEl){
+      vlmEl.addEventListener('input', () => {
+        if(document.getElementById('vlm_res_note')) document.getElementById('vlm_res_note').textContent = vlmEl.value + 'px';
+      });
+    }
     // 进页面自动加载两次数据：额度余额 + 自动任务状态
     refreshQuota();
     refreshStatus();
@@ -2826,16 +2874,20 @@ async function saveSettings(){
     quota: {
       idle_start: document.getElementById('quota_idle_start').value,
       idle_end: document.getElementById('quota_idle_end').value,
-      edge_min: parseInt(document.getElementById('quota_edge_min').value||'30'),
+      edge_min: parseInt(document.getElementById('quota_edge_min').value||'35'),
       batch_limit: parseInt(document.getElementById('quota_batch_limit').value||'20'),
       cooldown_sec: parseInt(document.getElementById('quota_cooldown').value||'1800'),
-      idle_percent: parseFloat(document.getElementById('quota_idle_percent').value||'5'),
+      floor_percent: parseFloat(document.getElementById('quota_floor_percent').value||'10'),
+      photo_burn_percent: parseFloat(document.getElementById('quota_photo_burn').value||'0.5'),
       enabled: document.getElementById('quota_enabled').checked,
     },
     config: {
-      MEMORY_THRESHOLD: parseFloat(document.getElementById('memory_threshold').value||'70'),
+      MEMORY_THRESHOLD: parseFloat(document.getElementById('memory_threshold').value||'75'),
       DAILY_PHOTO_QUANTITY: parseInt(document.getElementById('daily_qty').value||'5'),
       UNMEANINGFUL_THRESHOLD: parseFloat(document.getElementById('unmeaningful_threshold').value||'40'),
+      VLM_MAX_LONG_EDGE: parseInt(document.getElementById('vlm_max_long_edge').value||'1024'),
+      HOME_MIN_SCORE: parseFloat(document.getElementById('home_min_score').value||'60'),
+      HOME_HIDE_UNMEANINGFUL: document.getElementById('home_hide_unmeaningful').checked,
     }
   };
   try{

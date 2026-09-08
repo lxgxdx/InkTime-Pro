@@ -82,27 +82,32 @@ BIN_OUTPUT_DIR = os.environ.get("INKTIME_BIN_OUTPUT_DIR", "./output")
 # 自定义字体路径（为空则退回默认字体）
 FONT_PATH = ""
 
-# 每日选片“精彩度”阈值
-MEMORY_THRESHOLD = 70.0
+# 每日选片“精彩度”阈值（>75 才够格上每日一图）
+MEMORY_THRESHOLD = 75.0
 
 # 每日挑选的照片数量
 DAILY_PHOTO_QUANTITY = 5
 
-# 发送给 VLM 之前，先把图片长边缩放到该值（像素）。MiniMax 建议 512，省 token/成本。
-VLM_MAX_LONG_EDGE = 512
+# 发送给 VLM 之前，先把图片长边缩放到该值（像素）。1024 比 512 更清晰、评分更准，代价是更费 token。
+# 可在设置页"上传分辨率"滑块调整（512~2048）。可用环境变量 INKTIME_VLM_MAX_LONG_EDGE 覆盖。
+VLM_MAX_LONG_EDGE = int(os.environ.get("INKTIME_VLM_MAX_LONG_EDGE", 1024))
 
 # 无意义照片判定：memory_score 低于该值则视为"无意义"，跳过旁白与成品生成
 UNMEANINGFUL_THRESHOLD = float(os.environ.get("INKTIME_UNMEANINGFUL_THRESHOLD", 40.0))
 
 # ========== 5小时窗口对齐的 Token 感知调度参数（可选）==========
-# MiniMax 套餐额度是"5 小时一清、用不完浪费"。深夜空闲自动多扫照片把额度用掉。
+# MiniMax 套餐额度是"5 小时一清、用不完浪费"。每个窗口末期/空闲时段自动多扫照片、把额度烧到剩底线。
 IDLE_WINDOW_START = os.environ.get("INKTIME_IDLE_START", "23:00")   # 空闲时段起点（深夜）
 IDLE_WINDOW_END = os.environ.get("INKTIME_IDLE_END", "07:00")       # 空闲时段终点
 QUOTA_SCHEDULE_ENABLED = os.environ.get("INKTIME_QUOTA_SCHEDULE", "1") not in ("0", "false", "False")
-QUOTA_EDGE_MIN = float(os.environ.get("INKTIME_QUOTA_EDGE_MIN", 30))      # 窗口剩 <N 分钟触发
-QUOTA_PER_RUN_BATCH_LIMIT = int(os.environ.get("INKTIME_QUOTA_BATCH_LIMIT", 20))  # 每次限量
+QUOTA_EDGE_MIN = float(os.environ.get("INKTIME_QUOTA_EDGE_MIN", 35))      # 窗口剩 <N 分钟触发
+QUOTA_PER_RUN_BATCH_LIMIT = int(os.environ.get("INKTIME_QUOTA_BATCH_LIMIT", 20))  # 每次限量（上限）
 QUOTA_FIRE_COOLDOWN_SEC = int(os.environ.get("INKTIME_QUOTA_COOLDOWN", 1800))     # 冷却
-QUOTA_IDLE_PERCENT = float(os.environ.get("INKTIME_QUOTA_IDLE_PERCENT", 5.0))     # 空闲余量>N%才烧
+# 烧额度烧到剩 N% 就停（留应急底线）。旧键名 QUOTA_IDLE_PERCENT 保留作兜底。
+QUOTA_FLOOR_PERCENT = float(os.environ.get("INKTIME_QUOTA_FLOOR_PERCENT",
+                          os.environ.get("INKTIME_QUOTA_IDLE_PERCENT", "10.0")))
+# 估算用：每张约烧窗口额度的多少 %（首次跑后看 /api/quotas 的 percent 降幅可校准）
+QUOTA_PERCENT_PER_PHOTO = float(os.environ.get("INKTIME_QUOTA_PERCENT_PER_PHOTO", 0.5))
 
 # ========== 屏幕配置（多分辨率并存）==========
 # SCREENS 是列表：一次可为多块屏（不同尺寸/分辨率/颜色）同时出成品。
