@@ -1438,8 +1438,12 @@ def main():
     if concurrency > 1:
         print(f"[INFO] 并发模式：{concurrency} 个工作线程")
 
-    filelist_path = ROOT_DIR / "filelist.txt"
-    cache_path = ROOT_DIR / ".filelist_cache.txt"
+    # 临时文件写到"数据目录"（Docker 里 CONVERTED_DIR.parent=/app/data，已 chown 给降权用户），
+    # 不能写 ROOT_DIR(/app)——那是 root 所有，降权用户 Permission denied。
+    tmp_dir = CONVERTED_DIR.parent if str(CONVERTED_DIR.parent) else ROOT_DIR
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    filelist_path = tmp_dir / "filelist.txt"
+    cache_path = tmp_dir / ".filelist_cache.txt"
 
     if args.cache:
         print("[WARN] --cache 仅建议用于调试提速，不适合生产环境。")
