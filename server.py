@@ -65,13 +65,35 @@ PROGRESS_FILE = Path(os.environ.get("INKTIME_PROGRESS_FILE", str(LOG_DIR / "scan
 PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # ---- Token 感知调度参数（来自 config.py / 设置页 quota 段） ----
+# 这些是 import 时从 cfg 读的快照；设置页保存后经 _refresh_quota_globals() 同步（见该函数）。
 IDLE_WINDOW_START = str(getattr(cfg, "IDLE_WINDOW_START", "23:00") or "23:00")
 IDLE_WINDOW_END = str(getattr(cfg, "IDLE_WINDOW_END", "07:00") or "07:00")
-QUOTA_EDGE_MIN = float(getattr(cfg, "QUOTA_EDGE_MIN", 30) or 30)
+QUOTA_EDGE_MIN = float(getattr(cfg, "QUOTA_EDGE_MIN", 35) or 35)
 QUOTA_PER_RUN_BATCH_LIMIT = int(getattr(cfg, "QUOTA_PER_RUN_BATCH_LIMIT", 20) or 20)
 QUOTA_FIRE_COOLDOWN_SEC = int(getattr(cfg, "QUOTA_FIRE_COOLDOWN_SEC", 1800) or 1800)
-QUOTA_IDLE_PERCENT = float(getattr(cfg, "QUOTA_IDLE_PERCENT", 5.0) or 5.0)
+# 烧到剩 N% 就停（应急底线）。旧键 QUOTA_IDLE_PERCENT 保留作兜底。默认 10。
+QUOTA_FLOOR_PERCENT = float(getattr(cfg, "QUOTA_FLOOR_PERCENT",
+                             getattr(cfg, "QUOTA_IDLE_PERCENT", 10.0)) or 10.0)
+# 估算用：每张约烧窗口额度的多少 %（首次跑后看 /api/quotas 的 percent 降幅可校准）
+QUOTA_PERCENT_PER_PHOTO = float(getattr(cfg, "QUOTA_PERCENT_PER_PHOTO", 0.5) or 0.5)
 QUOTA_SCHEDULE_ENABLED = bool(getattr(cfg, "QUOTA_SCHEDULE_ENABLED", True))
+
+
+def _refresh_quota_globals() -> None:
+    """保存设置页后调用：把 cfg 的 quota 参数重新同步到本模块的模块级变量。
+
+    apply_to_config 改的是 config 模块；但 _should_fire_analyze/_is_in_idle_window 读的是
+    这里 import 时的快照。不刷新会导致设置页改了额度参数但调度器仍用旧值。"""
+    global IDLE_WINDOW_START, IDLE_WINDOW_END, QUOTA_EDGE_MIN, QUOTA_PER_RUN_BATCH_LIMIT, \
+           QUOTA_FIRE_COOLDOWN_SEC, QUOTA_FLOOR_PERCENT, QUOTA_PERCENT_PER_PHOTO, QUOTA_SCHEDULE_ENABLED
+    IDLE_WINDOW_START = str(getattr(cfg, "IDLE_WINDOW_START", "23:00") or "23:00")
+    IDLE_WINDOW_END = str(getattr(cfg, "IDLE_WINDOW_END", "07:00") or "07:00")
+    QUOTA_EDGE_MIN = float(getattr(cfg, "QUOTA_EDGE_MIN", 35) or 35)
+    QUOTA_PER_RUN_BATCH_LIMIT = int(getattr(cfg, "QUOTA_PER_RUN_BATCH_LIMIT", 20) or 20)
+    QUOTA_FIRE_COOLDOWN_SEC = int(getattr(cfg, "QUOTA_FIRE_COOLDOWN_SEC", 1800) or 1800)
+    QUOTA_FLOOR_PERCENT = float(getattr(cfg, "QUOTA_FLOOR_PERCENT", QUOTA_FLOOR_PERCENT) or QUOTA_FLOOR_PERCENT)
+    QUOTA_PERCENT_PER_PHOTO = float(getattr(cfg, "QUOTA_PERCENT_PER_PHOTO", QUOTA_PERCENT_PER_PHOTO) or QUOTA_PERCENT_PER_PHOTO)
+    QUOTA_SCHEDULE_ENABLED = bool(getattr(cfg, "QUOTA_SCHEDULE_ENABLED", True))
 
 # MiniMax Token Plan 剩余额度接口（必须用 .com，.io 旁路由连不上）
 _MINIMAX_REMAINS_URL = "https://api.minimaxi.com/v1/token_plan/remains"
@@ -132,40 +154,55 @@ def _is_in_idle_window(now: datetime) -> bool:
     return cur >= start_m or cur < end_m
 
 
-def _should_fire_analyze(now: datetime) -> tuple[bool, str]:
-    """Token 感知：是否应拉起 analyze 烧额度。
+def _estimate_batch(percent: float | None) -> int:
+    """按当前剩余额度%估算"这次该扫多少张"，烧到剩 QUOTA_FLOOR_PERCENT 就停。
 
-    用户确认策略：
-    - 空闲时段（深夜）且余量 > QUOTA_IDLE_PERCENT% → 烧
-    - 非空闲时段：距窗口重置 < QUOTA_EDGE_MIN 分钟 且仍有余量 → 烧（窗口快清零）
-    每周窗口仅展示，不参与触发。
+    线性估算：每张约烧 QUOTA_PERCENT_PER_PHOTO%。batch 被 QUOTA_PER_RUN_BATCH_LIMIT 截顶防失控。
+    percent=None（查不到额度）时用硬上限保守处理。
+    """
+    if percent is None:
+        return QUOTA_PER_RUN_BATCH_LIMIT
+    burnable = max(0.0, percent - QUOTA_FLOOR_PERCENT)
+    if burnable <= 0:
+        return 0
+    batch = int(round(burnable / QUOTA_PERCENT_PER_PHOTO)) if QUOTA_PERCENT_PER_PHOTO > 0 else QUOTA_PER_RUN_BATCH_LIMIT
+    return max(1, min(batch, QUOTA_PER_RUN_BATCH_LIMIT))
+
+
+def _should_fire_analyze(now: datetime) -> tuple[bool, int, str]:
+    """Token 感知：是否应拉起 analyze 烧额度。返回 (ok, batch, reason)。
+
+    用户确认策略：每个 5h 窗口末期都检查（非仅深夜）——
+    - 空闲时段（深夜）：余量 > 底线(QUOTA_FLOOR_PERCENT%) → 烧
+    - 非空闲：距窗口重置 < QUOTA_EDGE_MIN 分钟 且仍有余量 → 烧（窗口快清零，把余量用掉）
+    batch 按剩余额度自动估算，烧到剩 QUOTA_FLOOR_PERCENT% 就停。每周窗口仅展示，不参与触发。
     """
     if not QUOTA_SCHEDULE_ENABLED:
-        return False, "token 调度未启用"
+        return False, 0, "token 调度未启用"
     q = get_minimax_remains()
     if not q.get("ok") or not q.get("parsed"):
-        return False, f"miniMax 额度查询失败({q.get('error','')})"
+        return False, 0, f"miniMax 额度查询失败({q.get('error','')})"
     parsed = q["parsed"]
-    # 主信号：剩余百分比（该订阅下 total-usage 不可靠，计数常为 0）
     percent = parsed.get("percent")
     remains_time = parsed.get("remains_time")
-    remaining = parsed.get("remaining_5h")
 
     if percent is None:
-        return False, "未能读取 5h 剩余百分比"
+        return False, 0, "未能读取 5h 剩余百分比"
 
     idle = _is_in_idle_window(now)
-    if idle:
-        if percent > QUOTA_IDLE_PERCENT:
-            return True, f"空闲时段烧额度(余 {percent:.0f}%)"
-        return False, f"空闲时段但余量不足({percent:.0f}%)"
-    else:
-        edge_sec = QUOTA_EDGE_MIN * 60
-        if remains_time is not None and remains_time < edge_sec and percent > 0:
-            return True, f"窗口将清零(剩 {int(remains_time//60)}min, 余 {percent:.0f}%)"
-        if remains_time is not None:
-            return False, f"非空闲，窗口剩 {int(remains_time//60)}min"
-    return False, "非空闲且窗口未到边缘"
+    edge_sec = QUOTA_EDGE_MIN * 60
+    near_edge = remains_time is not None and remains_time < edge_sec
+
+    # 触发条件：空闲时段 或 窗口将清零（每个窗口末期都检查）
+    if not (idle or near_edge):
+        return False, 0, f"非空闲且窗口未到边缘(剩 {int(remains_time//60) if remains_time is not None else '?'}min)"
+
+    batch = _estimate_batch(percent)
+    if batch <= 0:
+        return False, 0, f"余量已到底线({percent:.0f}% ≤ {QUOTA_FLOOR_PERCENT:.0f}%)"
+
+    cause = "空闲时段烧额度" if idle else "窗口将清零"
+    return True, batch, f"{cause}(余 {percent:.0f}%, 本次约 {batch} 张)"
 
 
 # ========== 后台调度器（设置页"定时扫描/渲染"） ==========
@@ -265,8 +302,8 @@ class Scheduler:
         env["INKTIME_PROGRESS_FILE"] = str(PROGRESS_FILE)
 
         if job.get("quota_gated"):
-            # token 门控
-            ok, reason = _should_fire_analyze(now)
+            # token 门控：返回 (ok, batch, reason)，batch 由剩余额度估算
+            ok, batch, reason = _should_fire_analyze(now)
             if not ok:
                 # 门控未过：把本 job 下个检查点重排，避免空转
                 with self._lock:
@@ -278,9 +315,9 @@ class Scheduler:
             if time.monotonic() < cooldown_until:
                 print(f"[scheduler] analyze 冷却中，跳过")
                 return
-            # 注入批量上限
-            env["INKTIME_BATCH_LIMIT"] = str(QUOTA_PER_RUN_BATCH_LIMIT)
-            print(f"[scheduler] analyze 触发（{reason}），batch_limit={QUOTA_PER_RUN_BATCH_LIMIT}")
+            # 注入估算的批量（烧到剩底线）
+            env["INKTIME_BATCH_LIMIT"] = str(batch)
+            print(f"[scheduler] analyze 触发（{reason}），batch_limit={batch}")
 
         log_path = LOG_DIR / job["log"]
         # tee: 子进程输出同时进日志文件 + 容器 stdout，这样 docker logs 也能实时看到扫描进度
@@ -306,9 +343,10 @@ class Scheduler:
         return None
 
     def start_analyze_manual(self) -> tuple[bool, str]:
-        """网页点「开始扫描」：立即拉起 analyze（绕过 token 门控）。
+        """网页点「按额度烧到底线」：立即拉起 analyze（绕过 token 门控）。
 
-        遵守规则：已有一个 analyze 在跑则跳过；用 web_settings 的 batch_limit 限量。
+        遵守规则：已有一个 analyze 在跑则跳过；batch 由剩余额度自动估算（烧到剩 QUOTA_FLOOR_PERCENT%）。
+        查不到额度/已到底线时，退化为 batch_limit 上限（用户主动点按仍可扫）。
         """
         job = self._get_job("analyze")
         if job is None:
@@ -317,15 +355,26 @@ class Scheduler:
         if p is not None and p.poll() is None:
             return False, "正在扫描中，请稍候"
 
-        # 手动触发同样带 batch_limit（防止一次性扫太多）
+        # 估算本次批量：按剩余额度烧到剩底线。查不到额度用硬上限。
+        q = get_minimax_remains()
+        percent = q.get("parsed", {}).get("percent") if q.get("ok") else None
+        batch = _estimate_batch(percent)
+        if batch <= 0:
+            batch = QUOTA_PER_RUN_BATCH_LIMIT  # 已到底线：手动点按仍允许按上限扫
+        if percent is not None:
+            msg = f"已开始扫描，本次估算 {batch} 张（当前剩余额度 {percent:.0f}%）"
+        else:
+            msg = f"已开始扫描，本次按上限 {batch} 张"
+
+        # 注入估算的批量
         env = dict(os.environ)
-        env["INKTIME_BATCH_LIMIT"] = str(QUOTA_PER_RUN_BATCH_LIMIT)
+        env["INKTIME_BATCH_LIMIT"] = str(batch)
         env["INKTIME_PROGRESS_FILE"] = str(PROGRESS_FILE)
         log_path = LOG_DIR / job["log"]
         now = datetime.now()
         # tee: 手动扫描日志也实时进 docker logs
         shell_cmd = f"{shlex.join(list(job['cmd']))} 2>&1 | tee -a {shlex.quote(str(log_path))}"
-        print(f"[{now:%F %T}] [scheduler] 手动开始扫描，batch_limit={QUOTA_PER_RUN_BATCH_LIMIT}")
+        print(f"[{now:%F %T}] [scheduler] 手动开始扫描，batch_limit={batch}(余 {percent if percent is not None else '?'}%)")
         proc = subprocess.Popen(
             ["sh", "-c", shell_cmd],
             cwd=str(ROOT_DIR),
@@ -338,7 +387,7 @@ class Scheduler:
             for j in self.jobs:
                 if j["name"] == "analyze":
                     j["next_run"] = now2 + timedelta(seconds=_SCHED_TICK_SEC)
-        return True, "已开始扫描"
+        return True, msg
 
     def stop_analyze_manual(self) -> tuple[bool, str]:
         """网页点「停止扫描」：终止正在跑的 analyze 子进程。"""
@@ -376,8 +425,17 @@ class Scheduler:
                     for j in due:
                         j["last_run"] = now
                         j["next_run"] = self._next_run(j["cron"], now)
-                # 刷新配额状态（供 /api/status 展示），失败不影响调度
-                self._quota_status = _should_fire_analyze(now)
+                # 刷新配额状态（供 /api/status 展示），失败不影响调度。存 dict {fire,batch,reason,percent}
+                try:
+                    _ok, _batch, _reason = _should_fire_analyze(now)
+                    _pct = None
+                    try:
+                        _pct = get_minimax_remains().get("parsed", {}).get("percent")
+                    except Exception:
+                        pass
+                    self._quota_status = {"fire": _ok, "batch": _batch, "reason": _reason, "percent": _pct}
+                except Exception as e:
+                    self._quota_status = {"fire": False, "batch": 0, "reason": f"查询失败:{e}", "percent": None}
                 for j in due:
                     self._spawn(j, now)
             except Exception as e:
@@ -509,10 +567,13 @@ def ensure_review_table():
         print(f"[review] 建表失败（不影响浏览，仅提示）：{e}")
 
 
-def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", sort: str = "memory"):
+def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", sort: str = "memory",
+              min_score: float | None = None, hide_unmeaningful: bool = False):
     """分页读取 review 数据。支持按 MM-DD 过滤与排序。返回 (rows, total_count)。
 
     数据库不存在 / 表不存在 / 空库时，都返回空列表，让网页显示"还没有照片"，而不是报错 500。
+    min_score: 只返回 memory_score >= 该值的照片（None 不过滤）。
+    hide_unmeaningful: 隐藏 is_meaningful=0 的照片（列不存在时自动跳过，不报错）。
     """
     if page < 1:
         page = 1
@@ -546,10 +607,24 @@ def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", so
     where_sql = ""
     params: list[object] = []
 
+    # 探测 is_meaningful 列是否存在（旧库可能没有），缺列时跳过 hide_unmeaningful 条件
+    has_meaningful_col = any(r[1] == "is_meaningful" for r in c.execute("PRAGMA table_info(photo_scores)").fetchall())
+
     md = (md or "").strip()
     if md and len(md) == 5 and md[2] == "-":
         where_sql = f"WHERE {dt_expr} IS NOT NULL AND {md_expr} = ?"
         params.append(md)
+
+    # 叠加最低回忆度过滤（主页默认只显示高分）
+    if min_score is not None:
+        cond = f"COALESCE(memory_score, -1) >= ?"
+        where_sql = (where_sql + " AND " + cond) if where_sql else ("WHERE " + cond)
+        params.append(min_score)
+
+    # 叠加隐藏无意义（仅当列存在）
+    if hide_unmeaningful and has_meaningful_col:
+        cond = "COALESCE(is_meaningful, 0) = 1"
+        where_sql = (where_sql + " AND " + cond) if where_sql else ("WHERE " + cond)
 
     # total_count 也要跟随过滤
     if where_sql:
@@ -573,6 +648,9 @@ def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", so
     # 分页偏移量（第 588 行 SQL 里的 OFFSET ? 用）
     offset = (page - 1) * page_size
 
+    # is_meaningful 列可能不存在（旧库），缺列时用 NULL 占位，避免 SELECT 报错
+    meaning_col = "is_meaningful" if has_meaningful_col else "NULL AS is_meaningful"
+
     base_sql = f"""
         SELECT path,
                caption,
@@ -585,7 +663,8 @@ def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", so
                height,
                orientation,
                used_at,
-               side_caption
+               side_caption,
+               {meaning_col}
         FROM photo_scores
         {where_sql}
         {order_sql}
@@ -828,6 +907,7 @@ a{color:var(--accent)}
   </div>
   <span id="scanMsg"></span>
   <p style="margin-top:20px;margin-bottom:0">扫描完成、打了分之后回到本页就能看到照片卡片。</p>
+  <p style="color:var(--muted);font-size:13px;margin-top:12px;margin-bottom:0">显示不了？可能是低于设置的分值，<a href="/review?show_all=1">点这里显示全部</a>。</p>
 </div>
 <script>
 async function startScan(){
@@ -880,7 +960,7 @@ pollGlobalTasks();
 def build_html(rows, page: int, page_size: int, total_count: int):
     items_html = []
 
-    for path, caption, ptype, m_score, b_score, reason, exif_json, width, height, orientation, used_at, side_caption in rows:
+    for path, caption, ptype, m_score, b_score, reason, exif_json, width, height, orientation, used_at, side_caption, _meaningful in rows:
         safe_caption = html.escape(caption or "").replace("\n", "<br>")
         safe_side = html.escape(side_caption or "").replace("\n", "<br>")
         safe_type = html.escape(ptype or "")
@@ -1214,6 +1294,7 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       <button type="button" id="randomDateBtn">随机一天</button>
       <button type="button" id="homeBtn">回到首页</button>
       <button type="button" onclick="location.href='/settings'">设置</button>
+      <label style="display:inline-flex;align-items:center;gap:6px"><input type="checkbox" id="showAllToggle" style="width:auto">显示全部（含低分/无意义）</label>
     </div>
 
     <div class="controls pager" style="justify-content: space-between;">
@@ -1270,7 +1351,8 @@ def build_html(rows, page: int, page_size: int, total_count: int):
         const md = (url.searchParams.get('md') || '').trim();
         const sort = (url.searchParams.get('sort') || '').trim() || 'memory';
         const page = parseInt(url.searchParams.get('page') || '1', 10) || 1;
-        return {{ url, md, sort, page }};
+        const show_all = (url.searchParams.get('show_all') || '') === '1';
+        return {{ url, md, sort, page, show_all }};
       }}
 
       function setSelectsFromUrl() {{
@@ -1290,6 +1372,9 @@ def build_html(rows, page: int, page_size: int, total_count: int):
           if (daySelect) daySelect.value = '';
           if (statusLine) statusLine.textContent = '';
         }}
+        // "显示全部" checkbox 状态回填
+        const showAllToggle = document.getElementById('showAllToggle');
+        if (showAllToggle) showAllToggle.checked = p.show_all;
       }}
 
       function buildReviewUrl(md, sort, page) {{
@@ -1300,6 +1385,10 @@ def build_html(rows, page: int, page_size: int, total_count: int):
         if (sort) url.searchParams.set('sort', sort);
         else url.searchParams.delete('sort');
         url.searchParams.set('page', String(page || 1));
+        // 透传"显示全部"开关（读当前 URL 的 show_all，翻页/筛选不丢失）
+        const curShowAll = (new URL(window.location.href)).searchParams.get('show_all');
+        if (curShowAll === '1') url.searchParams.set('show_all', '1');
+        else url.searchParams.delete('show_all');
         return url.toString();
       }}
 
@@ -1381,6 +1470,23 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       if (sortSelect) sortSelect.addEventListener('change', onSortChange);
       if (randomBtn) randomBtn.addEventListener('click', pickRandomDate);
       if (homeBtn) homeBtn.addEventListener('click', goHome);
+
+      // "显示全部"开关切换：勾选/取消后带 show_all 重新加载本页
+      const showAllToggle = document.getElementById('showAllToggle');
+      if (showAllToggle) {{
+        showAllToggle.addEventListener('change', () => {{
+          const params = getParams();
+          const url = new URL(window.location.href);
+          url.pathname = '/review';
+          if (showAllToggle.checked) url.searchParams.set('show_all', '1');
+          else url.searchParams.delete('show_all');
+          // 保留当前 md/sort/page
+          if (params.md) url.searchParams.set('md', params.md);
+          if (params.sort && params.sort !== 'memory') url.searchParams.set('sort', params.sort);
+          url.searchParams.set('page', String(params.page || 1));
+          navigateTo(url.toString());
+        }});
+      }}
 
       // 兜底：用户在图片疯狂加载时点击任何链接/按钮，先 stop()，避免导航请求排队
       document.addEventListener('click', function (ev) {{
@@ -2446,6 +2552,10 @@ def api_save_settings():
     except Exception as e:
         print(f"[settings] apply_to_config 失败：{e}")
     try:
+        _refresh_quota_globals()  # 同步 QUOTA_* 模块级变量，否则调度器读旧值
+    except Exception as e:
+        print(f"[settings] 刷新额度参数失败：{e}")
+    try:
         scheduler.reload_from_settings()
     except Exception as e:
         print(f"[settings] scheduler reload 失败：{e}")
@@ -2622,7 +2732,7 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 <div class="hint">⭐ 每个任务下方会实时显示成一句人话：<span id="analyze_hint" class="ok"></span></div>
 <div class="hint">⭐ 每日出图同样：<span id="render_hint" class="ok"></span></div>
 <div class="controls" style="margin:10px 0;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;">
-  <button type="button" id="scanStartBtn" class="primary" onclick="startScan()">▶ 现在扫描</button>
+  <button type="button" id="scanStartBtn" class="primary" onclick="startScan()">▶ 按额度烧到底线</button>
   <button type="button" id="scanStopBtn" onclick="stopScan()">■ 停止扫描</button>
   <span class="subtitle" id="scanMsg" style="margin:0"></span>
 </div>
@@ -2630,7 +2740,7 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
   <div class="quota-row"><span class="q-label">扫描进度</span><div class="bar"><div class="bar-fill" id="scanProgressFill" style="width:0%"></div></div><span class="q-pct" id="scanProgressPct">0%</span></div>
   <div class="q-note" id="scanProgressNote">正在扫描…</div>
 </div>
-<div class="hint" style="margin-bottom:4px">「现在扫描」= 立刻按当前规则把相册里没打过分的新照片扫一遍（不受空闲时段限制），下方会显示实时进度。</div>
+<div class="hint" style="margin-bottom:4px">「按额度烧到底线」= 立刻把没打过分的新照片送去打分，按剩余额度自动算出该扫多少张，把额度用到底线（不受空闲时段限制），进度条实时显示。</div>
 <div class="statusline" id="statusBox">尚未查看调度状态</div>
 </details>
 
@@ -2945,7 +3055,10 @@ async function refreshStatus(){
     }
     if(st.quota){
       const g = st.quota;
-      const gv = Array.isArray(g)?(''+(g[0]?'⏰ 触发烧额度':'')+g[1]):''+JSON.stringify(g);
+      const pct = (g.percent>0? (Math.round(g.percent)+'%') : '—');
+      const gv = g.fire
+        ? '⏰ 应该烧额度（剩余 '+pct+'，本次约 '+g.batch+' 张）'
+        : '暂不烧（剩余 '+pct+' '+(g.reason||'')+'）';
       lines.push('额度利用：'+gv);
     }
     box.innerHTML = lines.join('<br>');
@@ -2953,7 +3066,7 @@ async function refreshStatus(){
     const running = !!st.scan_running;
     const startBtn = document.getElementById('scanStartBtn');
     const stopBtn = document.getElementById('scanStopBtn');
-    if(startBtn){ startBtn.disabled = running; startBtn.textContent = running ? '⏳ 扫描中…' : '▶ 现在扫描'; }
+    if(startBtn){ startBtn.disabled = running; startBtn.textContent = running ? '⏳ 扫描中…' : '▶ 按额度烧到底线'; }
     if(stopBtn){ stopBtn.disabled = !running; }
     refreshScanProgress(running);
   }catch(e){ box.textContent = '查询失败: '+e; }
@@ -3029,8 +3142,17 @@ def review():
 
     md = (request.args.get('md', '') or '').strip()
     sort = (request.args.get('sort', '') or 'memory').strip() or 'memory'
+    show_all = (request.args.get('show_all', '') or '').strip() == '1'
 
-    rows, total_count = load_rows(page=page, page_size=REVIEW_PAGE_SIZE, md=md, sort=sort)
+    # 默认隐藏低分/无意义；勾"显示全部"(show_all=1) 则不过滤
+    if show_all:
+        min_score, hide_unmeaningful = None, False
+    else:
+        min_score = float(getattr(cfg, "HOME_MIN_SCORE", 60.0) or 60.0)
+        hide_unmeaningful = bool(getattr(cfg, "HOME_HIDE_UNMEANINGFUL", True))
+
+    rows, total_count = load_rows(page=page, page_size=REVIEW_PAGE_SIZE, md=md, sort=sort,
+                                  min_score=min_score, hide_unmeaningful=hide_unmeaningful)
     if not rows:
         return Response(_build_empty_review_html(), mimetype="text/html; charset=utf-8")
 
@@ -3226,6 +3348,7 @@ if __name__ == "__main__":
     # 应用 Web 设置 + 启动后台调度器（定时扫描/渲染）
     try:
         web_settings.apply_to_config(cfg)
+        _refresh_quota_globals()  # 启动时也把 QUOTA_* 同步成设置页保存的最新值
     except Exception as e:
         print(f"[InkTime] 应用 web_settings 失败（继续运行）：{e}")
     try:
