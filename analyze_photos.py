@@ -797,7 +797,10 @@ def grid_key(lat: float, lon: float) -> Tuple[int, int]:
 
 def load_world_cities(csv_path: Path) -> Tuple[List[CityRecord], Dict[Tuple[int, int], List[int]]]:
     if not csv_path.exists():
-        raise SystemExit(f"[FATAL] 找不到城市索引文件: {csv_path}")
+        # 城市库只是 GPS 增强（给 VLM 喂"拍摄地点"），缺失时优雅降级：返回空城市库，
+        # resolve() 会返回空地点串，绝不阻塞扫描。避免容器/降权环境下 FATAL 中断整个批次。
+        print(f"[WARN] 城市索引文件不存在（{csv_path}），跳过地点信息，仅按无地点打分（不影响打分/出图）")
+        return [], {}
 
     cities: List[CityRecord] = []
     grid_index: Dict[Tuple[int, int], List[int]] = {}

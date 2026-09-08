@@ -58,8 +58,9 @@ FLASK_PORT = 8765
 # 是否开启照片库 WebUI（前期检验提示词选片效果时使用，跑通后建议关闭）
 ENABLE_REVIEW_WEBUI = True
 
-# 离线中文城市名索引，使用 geonames 数据制作
-WORLD_CITIES_CSV = "./data/world_cities_zh.csv"
+# 离线中文城市名索引，使用 geonames 数据制作。
+# Docker 里放 /app 根（镜像已 COPY），默认 ./world_cities_zh.csv 直接可读。
+WORLD_CITIES_CSV = os.environ.get("INKTIME_WORLD_CITIES", "./world_cities_zh.csv")
 
 # 网格大小（纬度/经度度数）；越大越快但精度略差。1.0 对大多数场景够用。
 CITY_GRID_DEG = 1.0

@@ -24,6 +24,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY analyze_photos.py render_daily_photo.py server.py \
      converter.py web_settings.py image_utils.py config-example.py ./
 
+# 中文城市索引（GPS→城市名，给 VLM 喂"拍摄地点"）。放 /app 根，配 ./world_cities_zh.csv 能直接读到
+COPY world_cities_zh.csv ./world_cities_zh.csv
+
 # config.py 不存在时用模板兜底一份（不含真实密钥，运行时挂载覆盖）
 RUN cp config-example.py config.py || true
 
