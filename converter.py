@@ -78,24 +78,61 @@ def normalize_crop(crop: Optional[dict]) -> dict:
         return dict(DEFAULT_CROP)
 
 
-def photo_fingerprint(path, screen) -> str:
-    """由原图路径 + 屏幕尺寸生成稳定指纹（不含随机性），用于 CONVERTED_DIR 下文件名。
+def render_orientation(img: Image.Image) -> str:
+    """按解码后图片的显示方向返回 "landscape" / "portrait" / "square"。
 
-    - 避免不同原图/不同屏重名；
-    - 同一原图同一屏再次生成时覆盖同名文件，天然幂等。
+    用 img.size（经 load_image_any 的 exif_transpose，已是人眼看的方向）判断：
+    宽>高=风景(landscape)、高>宽=人像(portrait)、相等=square。
+    """
+    w, h = img.size
+    if w > h:
+        return "landscape"
+    if h > w:
+        return "portrait"
+    return "square"
+
+
+def orientation_dims(screen: dict, orient: Optional[str]) -> tuple:
+    """返回某方向下的画布尺寸 (canvas_w, canvas_h)。
+
+    屏幕配置记的是默认方向（竖用）。landscape(风景横图) 时对调宽高（横用），
+    portrait/square 保持默认。orient 为空时按默认（portrait）。
+    """
+    screen = dict(screen or {})
+    w = int(screen.get("width", 480))
+    h = int(screen.get("height", 800))
+    if orient == "landscape":
+        return (h, w)          # 对调：横用
+    return (w, h)              # portrait / square / 缺省：默认竖用
+
+
+def photo_fingerprint(path, screen) -> str:
+    """由原图路径 + 屏幕尺寸 + 方向生成稳定指纹（不含随机性），用于 CONVERTED_DIR 下文件名。
+
+    - 避免不同原图/不同屏/不同方向重名；
+    - 同一原图同一屏同一方向再次生成时覆盖同名文件，天然幂等。
+    - 方向维度必须纳入，否则横竖成品互相覆盖。
     """
     p = str(path)
     w = int((screen or {}).get("width", 0))
     h = int((screen or {}).get("height", 0))
-    raw = f"{p}|{w}x{h}"
+    orient = str((screen or {}).get("orientation", "portrait"))
+    raw = f"{p}|{orient}|{w}x{h}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def crop_with_ai_box(img: Image.Image, crop: Optional[dict], target_w: int, target_h: int) -> Image.Image:
-    """按 AI 焦点 bbox + 目标宽高比裁剪，返回铺满 target_w x target_h 的图。
+    """按 AI 焦点 bbox + 目标宽高比做**真 cover 裁剪**，返回铺满 target_w x target_h 的图。
 
-    原则（cover）：以焦点中心为锚，区域面积最小且完全包含 bbox，然后按目标宽高比
-    横向/纵向伸展到覆盖整个原图；对越界做 clamp，bbox 无效则回退居中裁剪。
+    关键（v4 修复）：真正"保比例 cover" —— 裁掉溢出边（横图裁左右、竖图裁上下），
+    而不是把整幅图拉伸到目标比例（旧版 cover 计算 `need>=整图` + resize 导致变形）。
+    AI 的 crop 框只用来定位窗口中心、决定是否放大到主体，绝不影响目标比例。
+
+    原则：
+    - 目标比例固定为 target_w/target_h，裁剪窗口恒为该比例。
+    - 默认取"整幅图在该比例下的最大取景框"（cover：横裁左右/竖裁上下）。
+    - 若 AI bbox 足够小、能放进图内，则放大到恰好包含 bbox 的最小目标比例窗（真聚焦主体）。
+    - 窗口以焦点中心定位，clamp 进图（平移不改变比例）。
     """
     img = img.convert("RGB")
     img_w, img_h = img.size
@@ -105,6 +142,7 @@ def crop_with_ai_box(img: Image.Image, crop: Optional[dict], target_w: int, targ
     if target_w <= 0 or target_h <= 0:
         raise RuntimeError(f"目标尺寸非法: {target_w}x{target_h}")
 
+    target_ratio = target_w / target_h
     c = normalize_crop(crop)
 
     # 焦点 bbox 在原图上的像素范围
@@ -114,45 +152,38 @@ def crop_with_ai_box(img: Image.Image, crop: Optional[dict], target_w: int, targ
     by1 = c["y"] * img_h + c["h"] * img_h / 2.0
     cx = (bx0 + bx1) / 2.0
     cy = (by0 + by1) / 2.0
-
-    # 候选框宽高 = 恰好包含 bbox 的宽高
     box_w = max(bx1 - bx0, 1.0)
     box_h = max(by1 - by0, 1.0)
 
-    # 目标宽高比 cover：保证候选框铺满目标，主体不被裁
-    target_ratio = target_w / target_h
-    # 以中心为锚。先假设候选框占比正好把原图 cover 到目标比例：
-    # 所需原图取景框的宽高（在"铺满目标"前提下）。
-    # 我们从 bbox 出发：把 bbox 框按目标比例放大到足以覆盖整个原图。
-    #
-    # 设计：无论中心在哪，取一个至少覆盖 bbox、且比例 = target_ratio 的矩形，
-    # 其尺寸 = max(bbox_w, bbox_h * target_ratio) 作为"核心尺寸"，再放大到覆盖全图。
-    core_w = box_w
-    core_h = box_h
-    if box_w < box_h * target_ratio:
-        core_w = box_h * target_ratio
+    # 真 cover：整幅图在目标比例下的最大取景框（恒 <= 图，绝不失真）
+    if img_w / img_h > target_ratio:      # 图比目标更宽 → 裁左右，保留全高
+        cover_w = img_h * target_ratio
+        cover_h = img_h
+    else:                                 # 图更窄/更方 → 裁上下，保留全宽
+        cover_w = img_w
+        cover_h = img_w / target_ratio
+
+    # AI 缩放窗：恰好包含 bbox 的最小目标比例窗
+    if box_w / box_h > target_ratio:
+        zoom_w = box_w
+        zoom_h = box_w / target_ratio
     else:
-        core_h = box_w / target_ratio
+        zoom_w = box_h * target_ratio
+        zoom_h = box_h
 
-    # 覆盖整幅原图所需的放大系数：候选框要 >= 原图在"该比例 cover"下的最小取景。
-    # 原图整体在目标比例下 cover 所需的最小矩形：
-    need_w = img_w
-    need_h = img_w / target_ratio
-    if need_h < img_h:
-        need_h = img_h
-        need_w = img_h * target_ratio
+    # 选择：AI 窗能放进图内则用（真裁剪到焦点），否则退回整图 cover
+    if zoom_w <= img_w and zoom_h <= img_h:
+        win_w, win_h = zoom_w, zoom_h
+    else:
+        win_w, win_h = cover_w, cover_h
 
-    scale = max(need_w / core_w, need_h / core_h, 1.0)
-    crop_w = core_w * scale
-    crop_h = core_h * scale
+    # 以焦点中心定位，clamp 到原图内（平移不改变比例）
+    max_left = max(0.0, img_w - win_w)
+    max_top = max(0.0, img_h - win_h)
+    left = _clamp(cx - win_w / 2.0, 0.0, max_left)
+    top = _clamp(cy - win_h / 2.0, 0.0, max_top)
 
-    # 以焦点中心定位，clamp 到原图内
-    max_left = max(0.0, img_w - crop_w)
-    max_top = max(0.0, img_h - crop_h)
-    left = _clamp(cx - crop_w / 2.0, 0.0, max_left)
-    top = _clamp(cy - crop_h / 2.0, 0.0, max_top)
-
-    box = (int(round(left)), int(round(top)), int(round(left + crop_w)), int(round(top + crop_h)))
+    box = (int(round(left)), int(round(top)), int(round(left + win_w)), int(round(top + win_h)))
     # 确保不越界（浮点舍入防御）
     box = (
         max(0, box[0]),
@@ -161,10 +192,13 @@ def crop_with_ai_box(img: Image.Image, crop: Optional[dict], target_w: int, targ
         min(img_h, box[3]),
     )
     if box[2] - box[0] <= 0 or box[3] - box[1] <= 0:
-        # 兜底：居中 cover
-        box = (0, 0, img_w, img_h)
+        # 兜底：居中 cover（取整幅图在该比例下最大取景）
+        box = (0, 0, int(round(min(img_w, img_h * target_ratio))), int(round(min(img_h, img_w / target_ratio))))
+        if box[2] <= 0 or box[3] <= 0:
+            box = (0, 0, img_w, img_h)
 
     cropped = img.crop(box)
+    # 等比缩放回目标尺寸（box 比例已=target_ratio，缩放无扭曲）
     return cropped.resize((target_w, target_h), Image.LANCZOS)
 
 
@@ -182,7 +216,10 @@ def generate_converted_for_screens(
     screens: list[dict],
     converted_dir: Path,
 ) -> dict[str, Path]:
-    """为每个启用屏生成一张预裁切基图，写入 converted_dir/<screen_name>/<fp>.jpg。
+    """为每个启用屏生成一张预裁切基图，写入 converted_dir/<screen_name>/<orientation>/<fp>.jpg。
+
+    方向化（v4）：每张照片**只按它的真实方向**生成一档（横照横向、竖照竖向），
+    因此每张照片只出一张成品（省一半 token/IO）。方向由 img.size（显示方向）决定。
 
     Args:
         img: 已解码的 RGB 原图（analyze 阶段顺手传入，避免二次解码）。
@@ -192,10 +229,11 @@ def generate_converted_for_screens(
         converted_dir: 成品根目录。
 
     Returns:
-        {screen_name: Path} —— 写出的成品图文件路径。
+        {"<screen_name>/<orientation>": Path} —— 写出的成品图文件路径。
     """
     converted_dir = Path(converted_dir)
     written: dict[str, Path] = {}
+    orient = render_orientation(img)   # 照片真实方向
 
     for sc in screens:
         if not sc.get("enabled", True):
@@ -205,52 +243,67 @@ def generate_converted_for_screens(
         h = int(sc.get("height", 0))
         if w <= 0 or h <= 0:
             continue
-        # 成品图裁到"照片显示区"（画布减去底部文字区），铺进上方区域
+        # 成品图裁到"照片显示区"（画布减去底部文字区）：按该照片方向对调宽高
         ta = int(sc.get("text_area_height", 100))
-        img_area_h = max(1, h - ta)
+        dim_w, dim_h = orientation_dims(sc, orient)
+        img_area_h = max(1, dim_h - ta)
 
-        fp = photo_fingerprint(photo_path, sc)
+        eff_screen = dict(sc)
+        eff_screen["orientation"] = orient
+        fp = photo_fingerprint(photo_path, eff_screen)
         fname = f"{fp}.jpg"
-        out_dir = converted_dir / name
+        out_dir = converted_dir / name / orient
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / fname
 
         try:
-            img_cropped = crop_with_ai_box(img, crop, w, img_area_h)
+            img_cropped = crop_with_ai_box(img, crop, dim_w, img_area_h)
             img_cropped.save(out_path, format="JPEG", quality=90)
-            written[name] = out_path
+            written[f"{name}/{orient}"] = out_path
         except Exception as e:
-            print(f"[converter] 生成成品失败({name}): {e}")
+            print(f"[converter] 生成成品失败({name}/{orient}): {e}")
 
     return written
 
 
-def load_converted_or_crop(photo_path, crop: Optional[dict], screen: dict, converted_dir: Path):
-    """优先返回已在 CONVERTED_DIR 的成品图；缺失则现裁 + 回填。
+def load_converted_or_crop(
+    img: Image.Image,
+    photo_path,
+    crop: Optional[dict],
+    screen: dict,
+    converted_dir: Path,
+) -> tuple:
+    """优先返回已在 CONVERTED_DIR 的成品图；缺失则按该照片方向现裁 + 回填。
+
+    v4 改签名：第一个参数传**已解码的 img**（避免二次解码、并取真实方向）。
 
     Returns:
         (PIL.Image, Path | None) —— 图像 + 写出的成品路径（None 表示未写盘）。
     """
+    if img is None:
+        img = load_image_any(photo_path)
+    orient = render_orientation(img)
     try:
         converted_dir = Path(converted_dir)
         name = str(screen.get("name", "default"))
         w = int(screen.get("width", 0))
         h = int(screen.get("height", 0))
         if w > 0 and h > 0:
-            fp = photo_fingerprint(photo_path, screen)
-            cache_path = converted_dir / name / f"{fp}.jpg"
+            eff_screen = dict(screen)
+            eff_screen["orientation"] = orient
+            fp = photo_fingerprint(photo_path, eff_screen)
+            cache_path = converted_dir / name / orient / f"{fp}.jpg"
             if cache_path.exists():
-                img = Image.open(cache_path)
-                img = img.convert("RGB")
-                return img, cache_path
+                cached = Image.open(cache_path)
+                cached = cached.convert("RGB")
+                return cached, cache_path
     except Exception:
         pass
 
     # 缺失：现裁 + 回填
-    img = load_image_any(photo_path)
     try:
         written = generate_converted_for_screens(img, photo_path, crop, [screen], converted_dir)
-        saved = written.get(str(screen.get("name", "default")))
+        saved = written.get(f"{str(screen.get('name', 'default'))}/{orient}")
         return img, saved
     except Exception:
         return img, None

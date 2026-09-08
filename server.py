@@ -342,11 +342,12 @@ class Scheduler:
                     return j
         return None
 
-    def start_analyze_manual(self) -> tuple[bool, str]:
+    def start_analyze_manual(self, rescan: bool = False) -> tuple[bool, str]:
         """网页点「按额度烧到底线」：立即拉起 analyze（绕过 token 门控）。
 
         遵守规则：已有一个 analyze 在跑则跳过；batch 由剩余额度自动估算（烧到剩 QUOTA_FLOOR_PERCENT%）。
         查不到额度/已到底线时，退化为 batch_limit 上限（用户主动点按仍可扫）。
+        rescan=True 时注入 INKTIME_RESCAN=1，强制重扫已入库照片（改动后刷新评分/方向）。
         """
         job = self._get_job("analyze")
         if job is None:
@@ -365,11 +366,15 @@ class Scheduler:
             msg = f"已开始扫描，本次估算 {batch} 张（当前剩余额度 {percent:.0f}%）"
         else:
             msg = f"已开始扫描，本次按上限 {batch} 张"
+        if rescan:
+            msg = "已开始【重新扫描】，将重新打分已入库照片（" + msg.replace("已开始扫描，", "")
 
-        # 注入估算的批量
+        # 注入估算的批量 + 可选重扫标记
         env = dict(os.environ)
         env["INKTIME_BATCH_LIMIT"] = str(batch)
         env["INKTIME_PROGRESS_FILE"] = str(PROGRESS_FILE)
+        if rescan:
+            env["INKTIME_RESCAN"] = "1"
         log_path = LOG_DIR / job["log"]
         now = datetime.now()
         # tee: 手动扫描日志也实时进 docker logs
@@ -2575,7 +2580,9 @@ def api_status():
 @app.post("/api/scan/start")
 def api_scan_start():
     _require_webui_enabled()
-    ok, msg = scheduler.start_analyze_manual()
+    req = request.get_json(silent=True) or {}
+    rescan = bool(req.get("rescan"))
+    ok, msg = scheduler.start_analyze_manual(rescan=rescan)
     return Response(json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False), mimetype="application/json")
 
 
@@ -2734,6 +2741,7 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 <div class="controls" style="margin:10px 0;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;">
   <button type="button" id="scanStartBtn" class="primary" onclick="startScan()">▶ 按额度烧到底线</button>
   <button type="button" id="scanStopBtn" onclick="stopScan()">■ 停止扫描</button>
+  <button type="button" id="rescanBtn" onclick="rescanAll()">🔄 重新扫描已有照片</button>
   <span class="subtitle" id="scanMsg" style="margin:0"></span>
 </div>
 <div id="scanProgressBox" style="display:none;margin:8px 0;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;">
@@ -3116,6 +3124,19 @@ async function startScan(){
   }catch(e){ if(msg) msg.textContent = '启动失败: '+e; }
 }
 
+// 重新扫描：把目录里所有照片（含已入库）重新打分（改动后刷新评分/方向）
+async function rescanAll(){
+  const msg = document.getElementById('scanMsg');
+  if(!confirm('将把相册里所有照片重新打分（含已打分的），耗时/耗额度≈一次完整扫描。确定重新扫描？')) return;
+  if(msg) msg.textContent = '正在启动重新扫描…';
+  try{
+    const r = await getJSON('/api/scan/start', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({rescan:true})});
+    if(msg) msg.textContent = r.ok ? ('✅ '+(r.msg||'已重新扫描')) : (r.msg||'未开始');
+    refreshStatus();
+  }catch(e){ if(msg) msg.textContent = '重新扫描失败: '+e; }
+}
+
 async function stopScan(){
   const msg = document.getElementById('scanMsg');
   try{
@@ -3242,7 +3263,7 @@ def sim_render():
         }
 
     try:
-        img = rdp.render_image(meta)
+        img, _ = rdp.render_image(meta)   # v4 返回 (canvas, orientation)
         img_dithered = rdp.apply_four_color_dither(img)
 
         bio = BytesIO()
@@ -3275,6 +3296,58 @@ def esp_preview(key: str):
     if key != DOWNLOAD_KEY:
         abort(404)
     p = BIN_OUTPUT_DIR / "preview.png"
+    return _send_static_file(p)
+
+
+# ---------- 多屏 + 方向下载路由（v4 方向自适应） ----------
+def _screen_direction_path(screen: str, direction: str, filename: str) -> Path:
+    """校验 screen/direction 白名单并返回 <BIN_OUTPUT_DIR>/<screen>/<direction>/<filename>。
+
+    仅允许启用屏名 + landscape/portrait；_safe_join 防目录穿越。
+    """
+    if direction not in ("landscape", "portrait"):
+        abort(404)
+    valid_names = {str(sc.get("name")) for sc in getattr(cfg, "SCREENS", []) if sc.get("enabled", True)}
+    if screen not in valid_names:
+        valid_names.add(str(getattr(cfg, "SCREEN", {}).get("name", "")) if isinstance(getattr(cfg, "SCREEN", None), dict) else "")
+    if screen not in valid_names:
+        abort(404)
+    try:
+        p = _safe_join(BIN_OUTPUT_DIR / screen / direction, filename)
+    except ValueError:
+        abort(400)
+    return p
+
+
+@app.get("/static/inktime/<key>/<screen>/<direction>/latest.bin")
+def esp_latest_dir(key: str, screen: str, direction: str):
+    if key != DOWNLOAD_KEY:
+        abort(404)
+    p = _screen_direction_path(screen, direction, "latest.bin")
+    return _send_static_file(p)
+
+
+@app.get("/static/inktime/<key>/<screen>/<direction>/photo_<int:idx>.bin")
+def esp_photo_dir(key: str, screen: str, direction: str, idx: int):
+    if key != DOWNLOAD_KEY:
+        abort(404)
+    p = _screen_direction_path(screen, direction, f"photo_{idx}.bin")
+    return _send_static_file(p)
+
+
+@app.get("/static/inktime/<key>/<screen>/<direction>/preview.png")
+def esp_preview_dir(key: str, screen: str, direction: str):
+    if key != DOWNLOAD_KEY:
+        abort(404)
+    p = _screen_direction_path(screen, direction, "preview.png")
+    return _send_static_file(p)
+
+
+@app.get("/static/inktime/<key>/<screen>/<direction>/manifest.json")
+def esp_manifest_dir(key: str, screen: str, direction: str):
+    if key != DOWNLOAD_KEY:
+        abort(404)
+    p = _screen_direction_path(screen, direction, "manifest.json")
     return _send_static_file(p)
 
 

@@ -21,7 +21,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import config as cfg
 from image_utils import load_image_any, register_heif
-from converter import crop_with_ai_box, load_converted_or_crop
+from converter import crop_with_ai_box, load_converted_or_crop, orientation_dims, render_orientation
 register_heif()
 
 # 渲染子进程启动即应用设置页（改屏/阈值生效），保证 SCREENS 快照拿的是最新值
@@ -84,16 +84,22 @@ if not CONVERTED_DIR.is_absolute():
     CONVERTED_DIR = (ROOT_DIR / CONVERTED_DIR).resolve()
 
 # 屏幕参数 → 渲染函数配参（避免模块级常量写死）
-def _screen_params(screen: dict) -> tuple:
-    """返回 (canvas_w, canvas_h, text_area_h, palette, bin_format) 供单屏渲染。"""
+def _screen_params(screen: dict, orient: Optional[str] = None) -> tuple:
+    """返回 (canvas_w, canvas_h, text_area_h, palette, bin_format) 供单屏渲染。
+
+    orient: 照片方向（"landscape"/"portrait"/"square"）。landscape(横图) 时对调宽高（横用），
+            否则保持屏幕默认（竖用）。text_area_h 按画布高等比缩放，横摆时条带比例一致。
+    """
     screen = dict(screen or {})
-    width = int(screen.get("width", 480))
-    height = int(screen.get("height", 800))
-    cx_h_ratio = height / 800.0
-    ta = int(round(float(screen.get("text_area_height", 100 * cx_h_ratio))))
+    base_w = int(screen.get("width", 480))
+    base_h = int(screen.get("height", 800))
+    canvas_w, canvas_h = orientation_dims(screen, orient)   # landscape→(h,w) 对调
+    cx_h_ratio = canvas_h / 800.0
+    base_ta = float(screen.get("text_area_height", 100 * (base_h / 800.0))) if screen.get("text_area_height") else (100 * (base_h / 800.0))
+    ta = int(round(float(base_ta) * (canvas_h / base_h)))   # 文字区按画布高等比缩放（横摆自动变小，条带比例一致）
     pal = [tuple(c) for c in screen.get("palette", [(0, 0, 0), (255, 255, 255), (200, 0, 0), (220, 180, 0)])]
     bfmt = str(screen.get("bin_format", "1byte_per_px"))
-    return width, height, ta, pal, bfmt
+    return canvas_w, canvas_h, ta, pal, bfmt
 
 
 def _palette_idx_map(palette: list) -> dict:
@@ -458,18 +464,24 @@ def format_location(lat, lon, city: str) -> str:
 
 def render_image(item: Dict[str, Any], screen: Optional[Dict[str, Any]] = None) -> Image.Image:
     """
-    根据选中的 item 渲染一张 RGB 成品图（竖屏）：
-    - 上方图片：占 [0, canvas_h - text_area_h)，用 AI 裁切焦点（有则用，无则中心 cover）
-    - 底部 text_area_h 像素为文字区：第一行 side 文案（最多两行），第二行日期 + 地点
+    根据选中的 item 渲染一张 RGB 成品图（按照片方向自适应）：
+    - **先解码原图一次**（load_image_any 已 exif_transpose），由 img.size 得真实显示方向。
+    - 横照 → 画布对调宽高（横用，如 800×480）；竖照 → 默认（竖用，如 480×800）。
+    - 上方图片：占 [0, canvas_h - text_area_h)，用 AI 裁切焦点（有则用，无则真 cover 保比例）。
+    - 底部 text_area_h 像素为文字区：第一行 side 文案（最多两行），第二行日期 + 地点。
     screen: 某块屏的配置 dict；缺省用默认屏。多屏并存时逐屏调用各出一张。
     """
-    cw, ch, ta, _, _ = _screen_params(screen or SCREEN)
-    canvas = Image.new("RGB", (cw, ch), (255, 255, 255))
-    draw = ImageDraw.Draw(canvas)
-
     img_path = Path(item["path"])
     if not img_path.exists():
         raise RuntimeError(f"图片不存在: {img_path}")
+
+    # 解码一次取真实方向（不依赖 DB orientation，可能未 transpose 不一致）
+    img = load_image_any(img_path)
+    orient = render_orientation(img)
+
+    cw, ch, ta, _, _ = _screen_params(screen or SCREEN, orient)
+    canvas = Image.new("RGB", (cw, ch), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
 
     img_area_w = cw
     img_area_h = ch - ta  # 底部留给文字
@@ -483,20 +495,19 @@ def render_image(item: Dict[str, Any], screen: Optional[Dict[str, Any]] = None) 
                 "w": item.get("crop_w"), "h": item.get("crop_h")}
 
     # 优先用 CONVERTED_DIR 已裁切好的成品基图（analyze 阶段写盘，避免重解码原图）；
-    # 缺失则现裁 + 回填。
-    img_cropped, _ = load_converted_or_crop(str(img_path), crop, eff_screen, CONVERTED_DIR)
+    # 缺失则现裁 + 回填。传入已解码 img，内部按方向取。
+    img_cropped, _ = load_converted_or_crop(img, str(img_path), crop, eff_screen, CONVERTED_DIR)
 
-    # 稳健性：成品若尺寸不匹配（可能被旧 sc 缓存到全画布），重新按当前屏裁
+    # 稳健性：成品若尺寸不匹配，重新按当前屏裁
     if img_cropped.size != (img_area_w, img_area_h):
-        img = load_image_any(img_path)
         img_cropped = crop_with_ai_box(img, crop, img_area_w, img_area_h)
 
     # 贴到上方
     canvas.paste(img_cropped, (0, 0))
 
-    # ---------- 底部文字区域 ----------
-    padding_x = 24
-    text_area_top = ch - ta + 10
+    # ---------- 底部文字区域（两种方向都放底部横条） ----------
+    padding_x = max(8, int(round(24 * cw / 480.0)))   # 按画布宽等比
+    text_area_top = ch - ta + max(6, int(round(10 * ch / 800.0)))
     text_width = cw - 2 * padding_x
 
     try:
@@ -514,13 +525,13 @@ def render_image(item: Dict[str, Any], screen: Optional[Dict[str, Any]] = None) 
         lines = wrap_text_chinese(draw, side_text, font_big, text_width, max_lines=2)
         for line in lines:
             draw.text((padding_x, y), line, font=font_big, fill=(0, 0, 0))
-            y += 24  # 行高略大于字号
+            y += max(18, int(round(24 * ch / 800.0)))  # 行高等比
 
     # 日期 + 地点：固定在底部区域内的第二行
     date_display = format_date_display(item["date"])
     loc_display = format_location(item.get("lat"), item.get("lon"), item.get("city") or "")
 
-    second_line_y = text_area_top + 54
+    second_line_y = text_area_top + max(44, int(round(54 * ch / 800.0)))
     draw.text((padding_x, second_line_y), date_display, font=font_small, fill=(0, 0, 0))
 
     loc_w = draw.textlength(loc_display, font=font_small)
@@ -529,7 +540,7 @@ def render_image(item: Dict[str, Any], screen: Optional[Dict[str, Any]] = None) 
         loc_x = padding_x
     draw.text((loc_x, second_line_y), loc_display, font=font_small, fill=(0, 0, 0))
 
-    return canvas
+    return canvas, orient
 
 def apply_four_color_dither(img: Image.Image, palette=None) -> Image.Image:
     """
@@ -692,68 +703,99 @@ def main():
         print("[WARN] 没有任何启用屏（SCREENS 全为 enabled=False），跳过渲染。")
         return
 
-    # 对每个启用屏各出一套成品
+    # 对每个启用屏各出一套成品（每张照片按自身方向分目录）
     for screen in ENABLED_SCREENS:
         sname = str(screen.get("name", "default"))
-        sw, sh, _, spal, sbfmt = _screen_params(screen)
-        out_dir = BIN_OUTPUT_DIR / sname
-        out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"\n[屏幕] {sname} {sw}x{sh} ({sbfmt})")
+        spal = [tuple(c) for c in screen.get("palette", [(0, 0, 0), (255, 255, 255), (200, 0, 0), (220, 180, 0)])]
+        sbfmt = str(screen.get("bin_format", "1byte_per_px"))
+        out_root = BIN_OUTPUT_DIR / sname
+        out_root.mkdir(parents=True, exist_ok=True)
+        print(f"\n[屏幕] {sname} ({sbfmt})")
+
+        # 每方向一个计数器（该方向内的相对序号 photo_0..N 连续）
+        dir_counter: dict[str, int] = {}
+        dir_manifest: dict[str, list] = {}
 
         for idx, chosen in enumerate(photos):
             print(f"  [第 {idx} 张] {chosen['path']} 回忆度={chosen['memory']}")
 
-            # 渲染成完整成品图（照片 + 文案 + 日期 + 地点）
-            img = render_image(chosen, screen)
+            # 渲染成完整成品图（照片 + 文案 + 日期 + 地点），返回其方向
+            img, orient = render_image(chosen, screen)
+
+            # 按方向分目录
+            d = out_root / orient
+            d.mkdir(parents=True, exist_ok=True)
+            rel = dir_counter.get(orient, 0)
+            dir_counter[orient] = rel + 1
 
             # 抖动成墨水屏风格
             img_dithered = apply_four_color_dither(img, spal)
 
-            # 保存预览 PNG（已经是抖动后的效果），按索引区分
-            preview_path = out_dir / f"preview_{idx}.png"
+            # 保存预览 PNG（已经是抖动后的效果），方向内相对序号
+            preview_path = d / f"preview_{rel}.png"
             img_dithered.save(preview_path)
             print(f"  [OK] 已保存预览 PNG: {preview_path}")
 
-            # 转 BIN：photo_0.bin, photo_1.bin, ...
-            bin_data = image_to_palette_bin(img_dithered, sw, sh, spal, sbfmt)
-            bin_path = out_dir / f"photo_{idx}.bin"
+            # 转 BIN（方向对调后的画布尺寸）
+            fw, fh, _, _, _ = _screen_params(screen, orient)
+            bin_data = image_to_palette_bin(img_dithered, fw, fh, spal, sbfmt)
+            bin_path = d / f"photo_{rel}.bin"
             with open(bin_path, "wb") as f:
                 f.write(bin_data)
             print(f"  [OK] 已生成 BIN: {bin_path} （大小 {len(bin_data)} 字节）")
 
-            # 头文件数组：photo_0.h, photo_1.h，数组名区分开
-            h_path = out_dir / f"photo_{idx}.h"
-            array_name = f"daily_bin_{idx}"
+            # 头文件数组
+            h_path = d / f"photo_{rel}.h"
+            array_name = f"daily_bin_{rel}"
             write_h_array(bin_path, h_path, array_name=array_name)
             print(f"  [OK] 已生成头文件数组: {h_path}")
 
-        # 为兼容旧流程，再额外生成 latest.* 指向第 0 张
-        first_bin = out_dir / "photo_0.bin"
-        first_h = out_dir / "photo_0.h"
-        first_preview = out_dir / "preview_0.png"
-        latest_bin = out_dir / "latest.bin"
-        latest_h = out_dir / "latest.h"
-        latest_preview = out_dir / "preview.png"
+            # 记录 manifest 条目
+            dir_manifest.setdefault(orient, []).append({
+                "rel": rel,
+                "path": chosen["path"],
+                "date": chosen.get("date", ""),
+                "side": chosen.get("side", ""),
+                "memory": chosen.get("memory"),
+            })
 
-        if first_bin.exists():
-            shutil.copyfile(first_bin, latest_bin)
-            print(f"  [OK] 已更新 latest.bin -> {first_bin.name}")
-        if first_h.exists():
-            shutil.copyfile(first_h, latest_h)
-            print(f"  [OK] 已更新 latest.h -> {first_h.name}")
-        if first_preview.exists():
-            shutil.copyfile(first_preview, latest_preview)
-            print(f"  [OK] 已更新 preview.png -> {first_preview.name}")
+        # 每方向同步 latest.* 指向该方向 photo_0 + 写 manifest.json
+        for orient, entries in dir_manifest.items():
+            d = out_root / orient
+            cw, ch, _, _, _ = _screen_params(screen, orient)
+            first_bin = d / "photo_0.bin"
+            first_h = d / "photo_0.h"
+            first_preview = d / "preview_0.png"
+            if first_bin.exists():
+                shutil.copyfile(first_bin, d / "latest.bin")
+                print(f"  [OK] {orient} 已更新 latest.bin -> photo_0.bin")
+            if first_h.exists():
+                shutil.copyfile(first_h, d / "latest.h")
+            if first_preview.exists():
+                shutil.copyfile(first_preview, d / "preview.png")
 
-    # 兼容旧路径：默认屏的产物复制到 BIN_OUTPUT_DIR 顶层（旧 ESP/模拟器用 latest.bin）
+            manifest = {
+                "screen": sname,
+                "orientation": orient,
+                "canvas": {"width": cw, "height": ch},
+                "bin_format": sbfmt,
+                "palette_size": len(spal),
+                "count": len(entries),
+                "latest": "photo_0.bin",
+                "photos": entries,
+            }
+            (d / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"  [OK] {orient} 已写 manifest.json (count={len(entries)}, canvas={cw}x{ch})")
+
+    # 兼容旧路径：默认屏 portrait 方向的产物复制到 BIN_OUTPUT_DIR 顶层（旧 ESP/模拟器用 latest.bin）
     default_name = str(DEFAULT_SCREEN.get("name", "default"))
-    default_dir = BIN_OUTPUT_DIR / default_name
+    default_dir = BIN_OUTPUT_DIR / default_name / "portrait"
     top_latest_bin = BIN_OUTPUT_DIR / "latest.bin"
     top_latest_h = BIN_OUTPUT_DIR / "latest.h"
     top_preview = BIN_OUTPUT_DIR / "preview.png"
     if (default_dir / "latest.bin").exists():
         shutil.copyfile(default_dir / "latest.bin", top_latest_bin)
-        print(f"[OK] 已同步默认屏 latest.bin -> {top_latest_bin}")
+        print(f"[OK] 已同步默认屏 portrait latest.bin -> {top_latest_bin}")
     if (default_dir / "latest.h").exists():
         shutil.copyfile(default_dir / "latest.h", top_latest_h)
     if (default_dir / "preview.png").exists():

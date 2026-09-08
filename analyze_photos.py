@@ -628,7 +628,9 @@ def read_exif(path: Path) -> dict:
     try:
         img = Image.open(path)
         try:
-            width, height = img.size
+            # 用 exif_transpose 得到"显示方向"（与 load_image_any 渲染一致），避免存储方向与实际不符
+            disp = ImageOps.exif_transpose(img)
+            width, height = disp.size
             info["width"] = int(width)
             info["height"] = int(height)
             if width > height:
@@ -1409,6 +1411,8 @@ def main():
                         help="调试模式：请求失败时打印请求体和响应体")
     parser.add_argument("--batch-limit", type=int, default=None,
                         help="本次最多处理 N 张（覆盖 config.BATCH_LIMIT，供 Token 感知调度限流）")
+    parser.add_argument("--rescan", action="store_true",
+                        help="重新扫描：跳过 filter_unscored，对目录里所有照片（含已入库）重新打分（INSERT OR REPLACE 覆盖更新）")
     args = parser.parse_args()
 
     # 应用 Web 设置页保存的动态配置（API key / 屏幕 / 阈值），并重建渠道状态
@@ -1546,11 +1550,17 @@ def main():
     ).fetchone()[0]
     print(f"[INFO] 数据库中已有 {counted} 张已分析照片（仅统计当前目录）。")
 
-    target_paths = filter_unscored(conn, imgs)
-    if not target_paths:
-        print("[INFO] 所有图片都已经在 photo_scores 中有记录。")
-        conn.close()
-        return
+    # 重新扫描：跳过 filter_unscored，全量重扫（含已入库）；否则只扫未入库的新照片
+    is_rescan = bool(args.rescan) or (os.environ.get("INKTIME_RESCAN") == "1")
+    if is_rescan:
+        target_paths = list(imgs)
+        print(f"[INFO] 【重新扫描】将重扫全部 {len(target_paths)} 张（含已打分，INSERT OR REPLACE 覆盖更新）")
+    else:
+        target_paths = filter_unscored(conn, imgs)
+        if not target_paths:
+            print("[INFO] 所有图片都已经在 photo_scores 中有记录。")
+            conn.close()
+            return
 
     if args.batch_limit is not None and args.batch_limit > 0:
         target_paths = target_paths[:args.batch_limit]
@@ -1566,7 +1576,8 @@ def main():
 
     # 进度条口径：以“本次启动时的快照”为准。
     # total = 已分析(当前目录) + 本次待处理（filter_unscored 产生的目标集合）
-    already_done = counted
+    # 重扫时已分析不叠加（全量重扫），避免 7000+7000 的错位。
+    already_done = 0 if is_rescan else counted
     total = already_done + len(target_paths)
     print(f"[INFO] 本次准备处理 {len(target_paths)} 张图片（快照总数 {total}，已分析 {already_done}）。")
     # 尽早上报一次初始进度，让网页立刻显示"正在扫描"，而不是等第一张处理完才冒出来
