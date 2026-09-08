@@ -820,9 +820,8 @@ a{color:var(--accent)}
 </style>
 </head>
 <body>
+<div id="globalTaskBar" style="display:none"></div>
 <div class="card">
-  <h1>📷 欢迎使用 InkTime</h1>
-  <p>照片库目前还是空的。要让墨水屏显示照片，需要先做两步：<br>① 在「设置」里填一个大模型密钥（打分、写文案用）；② 点「开始扫描」，把相册里没打过分的新照片送去处理。</p>
   <div class="btns">
     <button type="button" class="primary" onclick="startScan()">⏯ 开始扫描</button>
     <button type="button" class="ghost" onclick="location.href='/settings'">⚙ 去设置（填密钥）</button>
@@ -843,6 +842,36 @@ async function startScan(){
   }catch(e){ if(msg) msg.textContent = '启动失败: '+e; }
   setTimeout(()=>{ location.reload(); }, 15000);   // 15 秒后自动刷新看进度
 }
+
+// —— 全局后台任务状态条 ——
+function pollGlobalTasks(){
+  const bar = document.getElementById('globalTaskBar');
+  if(!bar) return;
+  fetch('/api/status').then(r=>r.json()).then(st=>{
+    const running = !!st.scan_running;
+    if(!running){ bar.style.display='none'; return; }
+    fetch('/api/scan/progress').then(r=>r.json()).then(p=>{
+      const pp=(p&&p.progress)||{};
+      const pct=(pp.percent||0);
+      const cur = pp.current ? String(pp.current).split(/[\\/]/).pop() : '';
+      bar.style.display='block';
+      bar.style.background='#16181d'; bar.style.border='1px solid #2a2e37';
+      bar.style.borderRadius='14px'; bar.style.padding='12px 14px'; bar.style.margin='0 auto 16px';
+      bar.style.maxWidth='560px';
+      bar.innerHTML=
+        '<div style="font-size:13px;color:#9cffd6;font-weight:600;margin-bottom:6px">⏳ 后台任务运行中 · 正在扫描照片</div>'+
+        '<div style="display:flex;align-items:center;gap:10px">'+
+          '<div style="flex:1;height:12px;background:#2a2e37;border-radius:6px;overflow:hidden">'+
+            '<div style="height:100%;width:'+Math.min(100,Math.max(0,pct))+'%;background:linear-gradient(90deg,#3fb58a,#54d6a4);border-radius:6px"></div>'+
+          '</div>'+
+          '<div style="font-size:12px;color:#8a93a3;width:70px;text-align:right">'+pct+'%</div>'+
+        '</div>'+
+        '<div style="font-size:12px;color:#8a93a3;margin-top:6px">已处理 '+(pp.done||0)+'/'+(pp.total||0)+(cur?' · '+cur:'')+'</div>';
+    }).catch(()=>{});
+  }).catch(()=>{});
+  setTimeout(pollGlobalTasks, 2000);
+}
+pollGlobalTasks();
 </script>
 </body>
 </html>"""
@@ -1153,6 +1182,8 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       数据库：{html.escape(str(DB_PATH))}{md_hint} · 当前页 {page} · 本页 {len(rows)} 张 · 总计 {total_count} 张（每页 {page_size} 张）
     </div>
 
+    <div id="globalTaskBar" style="display:none"></div>
+
     <div class="controls">
       <label>
         月份：
@@ -1365,6 +1396,42 @@ def build_html(rows, page: int, page_size: int, total_count: int):
 
       setSelectsFromUrl();
     }});
+
+    // —— 全局后台任务状态条：无论在哪页都显示正在跑的任务（切页不丢）——
+    pollGlobalTasks();
+  </script>
+
+  <script>
+    // 全局任务轮询：扫描运行时顶部显示进度条，切回页面立即恢复
+    function pollGlobalTasks(){{
+      const bar = document.getElementById('globalTaskBar');
+      if (!bar) return;
+      fetch('/api/status').then(r => r.json()).then(st => {{
+        const running = !!st.scan_running;
+        if (!running) {{ bar.style.display = 'none'; return; }}
+        fetch('/api/scan/progress').then(r => r.json()).then(p => {{
+          const pp = (p && p.progress) || {{}};
+          const pct = (pp.percent || 0);
+          const cur = pp.current ? String(pp.current).split(/[\\\\/]/).pop() : '';
+          bar.style.display = 'block';
+          bar.innerHTML =
+            '<div style="font-size:13px;color:#9cffd6;font-weight:600;margin-bottom:6px">⏳ 后台任务运行中 · 正在扫描照片</div>' +
+            '<div style="display:flex;align-items:center;gap:10px">' +
+              '<div style="flex:1;height:12px;background:#2a2e37;border-radius:6px;overflow:hidden">' +
+                '<div style="height:100%;width:' + Math.min(100, Math.max(0, pct)) + '%;background:linear-gradient(90deg,#3fb58a,#54d6a4);border-radius:6px"></div>' +
+              '</div>' +
+              '<div style="font-size:12px;color:#8a93a3;width:70px;text-align:right">' + pct + '%</div>' +
+            '</div>' +
+            '<div style="font-size:12px;color:#8a93a3;margin-top:6px">已处理 ' + (pp.done||0) + '/' + (pp.total||0) + (cur ? ' · ' + cur : '') + '</div>';
+          bar.style.background = '#16181d';
+          bar.style.border = '1px solid #2a2e37';
+          bar.style.borderRadius = '14px';
+          bar.style.padding = '12px 14px';
+          bar.style.margin = '0 0 16px';
+        }}).catch(()=>{{}});
+      }}).catch(()=>{{}});
+      setTimeout(pollGlobalTasks, 2000);
+    }}
   </script>
 </body>
 </html>
