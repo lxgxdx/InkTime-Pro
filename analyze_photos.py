@@ -26,6 +26,54 @@ from converter import (
 )
 
 
+# =======================
+# 扫描进度上报（供 Web 页面轮询显示）
+# =======================
+# 进度文件路径：server 拉起 analyze 时通过环境变量 INKTIME_PROGRESS_FILE 注入。
+# analyze 每处理一张就把进度写成 JSON，server /api/scan/progress 读它返回给前端。
+SCAN_PROGRESS_FILE = os.environ.get("INKTIME_PROGRESS_FILE", "")
+
+
+def report_scan_progress(
+    done: int,
+    total: int,
+    phase: str = "",
+    current: str = "",
+    detail: str = "",
+) -> None:
+    """把当前扫描进度写入进度文件（单次 json 覆盖写，读到的是最新快照）。
+
+    失败静默——进度上报只是增强，绝不影响扫描主体。
+    """
+    if not SCAN_PROGRESS_FILE:
+        return  # 未注入进度文件路径（比如命令行直接跑），跳过
+    try:
+        pct = (done / total) if total > 0 else 0.0
+        payload = {
+            "done": done,
+            "total": total,
+            "percent": round(100.0 * pct, 1),
+            "phase": phase,
+            "current": current,
+            "detail": detail,
+        }
+        path = Path(SCAN_PROGRESS_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def clear_scan_progress() -> None:
+    """扫描结束后清除进度文件，让前端回到『未在扫描』状态。"""
+    if not SCAN_PROGRESS_FILE:
+        return
+    try:
+        Path(SCAN_PROGRESS_FILE).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _is_think_model(name: str) -> bool:
     """判断某模型是否默认带 <think> 思考块（需要显式关闭推理）。
 
@@ -1513,6 +1561,8 @@ def main():
     already_done = counted
     total = already_done + len(target_paths)
     print(f"[INFO] 本次准备处理 {len(target_paths)} 张图片（快照总数 {total}，已分析 {already_done}）。")
+    # 尽早上报一次初始进度，让网页立刻显示"正在扫描"，而不是等第一张处理完才冒出来
+    report_scan_progress(already_done, total, phase="prepare", current="", detail=f"共 {len(target_paths)} 张待处理")
 
     cur = conn.cursor()
     db_lock = threading.Lock()   # 保护 SQLite 写入操作
@@ -1551,6 +1601,7 @@ def main():
             eta = format_eta(remaining * avg_per) if avg_per > 0 else "00:00:00"
 
             print(f"[进度] {bar} {progress*100:5.1f}%  {processed_now}/{total}  本张耗时 {total_cost:4.1f}s  预计剩余 {eta} ")
+            report_scan_progress(processed_now, total, phase="analyze", current=str(path), detail=f"耗时 {total_cost:.1f}s")
     else:
         # ==================== 并发模式 ====================
         print_lock = threading.Lock()
@@ -1601,9 +1652,11 @@ def main():
 
                     cost_str = f"{rec['cost']:4.1f}s" if rec else "N/A"
                     print(f"[进度] {bar} {progress*100:5.1f}%  {processed_now}/{total}  本张耗时 {cost_str}  预计剩余 {eta} ")
+                    report_scan_progress(processed_now, total, phase="analyze", current=str(path), detail=f"耗时 {cost_str}")
 
     conn.close()
     print("\n[完成] 本批次处理完成。")
+    clear_scan_progress()
 
 
 if __name__ == "__main__":

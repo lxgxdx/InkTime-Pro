@@ -19,6 +19,7 @@ from image_utils import load_image_any, _RAW_EXTS, _TRANSCODE_EXTS, register_hei
 register_heif()
 import threading
 import subprocess
+import shlex
 import sys
 import time
 from datetime import datetime, timedelta
@@ -58,6 +59,10 @@ if DAILY_PHOTO_QUANTITY < 1:
 
 LOG_DIR = Path(os.environ.get("INKTIME_LOG_DIR", str(ROOT_DIR / "logs"))).expanduser()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# 扫描进度文件路径：analyze 子进程每处理一张就写到这里，/api/scan/progress 读它返回给网页。
+PROGRESS_FILE = Path(os.environ.get("INKTIME_PROGRESS_FILE", str(LOG_DIR / "scan_progress.json"))).expanduser()
+PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # ---- Token 感知调度参数（来自 config.py / 设置页 quota 段） ----
 IDLE_WINDOW_START = str(getattr(cfg, "IDLE_WINDOW_START", "23:00") or "23:00")
@@ -257,6 +262,7 @@ class Scheduler:
 
         cmd = list(job["cmd"])
         env = dict(os.environ)
+        env["INKTIME_PROGRESS_FILE"] = str(PROGRESS_FILE)
 
         if job.get("quota_gated"):
             # token 门控
@@ -277,15 +283,14 @@ class Scheduler:
             print(f"[scheduler] analyze 触发（{reason}），batch_limit={QUOTA_PER_RUN_BATCH_LIMIT}")
 
         log_path = LOG_DIR / job["log"]
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n[{now:%F %T}] [scheduler] start {name}\n")
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(ROOT_DIR),
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                env=env,
-            )
+        # tee: 子进程输出同时进日志文件 + 容器 stdout，这样 docker logs 也能实时看到扫描进度
+        shell_cmd = f"{shlex.join(cmd)} 2>&1 | tee -a {shlex.quote(str(log_path))}"
+        print(f"[{now:%F %T}] [scheduler] start {name}")
+        proc = subprocess.Popen(
+            ["sh", "-c", shell_cmd],
+            cwd=str(ROOT_DIR),
+            env=env,
+        )
         with self._lock:
             self._proc[name] = proc
             if job.get("quota_gated"):
@@ -315,17 +320,17 @@ class Scheduler:
         # 手动触发同样带 batch_limit（防止一次性扫太多）
         env = dict(os.environ)
         env["INKTIME_BATCH_LIMIT"] = str(QUOTA_PER_RUN_BATCH_LIMIT)
+        env["INKTIME_PROGRESS_FILE"] = str(PROGRESS_FILE)
         log_path = LOG_DIR / job["log"]
         now = datetime.now()
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n[{now:%F %T}] [scheduler] 手动开始扫描\n")
-            proc = subprocess.Popen(
-                list(job["cmd"]),
-                cwd=str(ROOT_DIR),
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                env=env,
-            )
+        # tee: 手动扫描日志也实时进 docker logs
+        shell_cmd = f"{shlex.join(list(job['cmd']))} 2>&1 | tee -a {shlex.quote(str(log_path))}"
+        print(f"[{now:%F %T}] [scheduler] 手动开始扫描，batch_limit={QUOTA_PER_RUN_BATCH_LIMIT}")
+        proc = subprocess.Popen(
+            ["sh", "-c", shell_cmd],
+            cwd=str(ROOT_DIR),
+            env=env,
+        )
         with self._lock:
             self._proc["analyze"] = proc
             # 下次自动触发推迟一点，避免刚手动跑完又自动跑
@@ -333,7 +338,6 @@ class Scheduler:
             for j in self.jobs:
                 if j["name"] == "analyze":
                     j["next_run"] = now2 + timedelta(seconds=_SCHED_TICK_SEC)
-        print(f"[scheduler] 手动开始扫描，batch_limit={QUOTA_PER_RUN_BATCH_LIMIT}")
         return True, "已开始扫描"
 
     def stop_analyze_manual(self) -> tuple[bool, str]:
@@ -566,6 +570,9 @@ def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", so
         # 默认 memory
         order_sql = "ORDER BY COALESCE(memory_score, -1) DESC, COALESCE(beauty_score, -1) DESC, path"
 
+    # 分页偏移量（第 588 行 SQL 里的 OFFSET ? 用）
+    offset = (page - 1) * page_size
+
     base_sql = f"""
         SELECT path,
                caption,
@@ -788,6 +795,58 @@ def extract_date_from_exif(exif_json: str | None) -> str:
 # --------------------------
 # HTML builders
 # --------------------------
+
+def _build_empty_review_html() -> str:
+    """空库时的照片库主页：引导去设置页填密钥 / 直接点扫描，而不是 404。"""
+    return """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InkTime 照片库</title>
+<style>
+:root{--bg:#0b0c10;--panel:#16181d;--card:#1d2027;--text:#e6e8ee;--muted:#8a93a3;--line:#2a2e37;--accent:#8ab4ff;--accent2:#9cffd6;--radius:14px;}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;margin:0;padding:24px;}
+.card{max-width:560px;margin:8vh auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:32px;text-align:center;}
+h1{font-size:22px;margin:0 0 10px;font-weight:600}
+p{color:var(--muted);font-size:14px;line-height:1.7;margin:0 0 20px}
+.btns{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+button{background:var(--accent);color:#0b0c10;border:none;border-radius:8px;padding:12px 22px;font-size:15px;font-weight:600;cursor:pointer}
+button.ghost{background:var(--card);color:var(--text);border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:not-allowed}
+a{color:var(--accent)}
+#scanMsg{display:block;margin-top:16px;font-size:13px;color:var(--accent2)}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📷 欢迎使用 InkTime</h1>
+  <p>照片库目前还是空的。要让墨水屏显示照片，需要先做两步：<br>① 在「设置」里填一个大模型密钥（打分、写文案用）；② 点「开始扫描」，把相册里没打过分的新照片送去处理。</p>
+  <div class="btns">
+    <button type="button" class="primary" onclick="startScan()">⏯ 开始扫描</button>
+    <button type="button" class="ghost" onclick="location.href='/settings'">⚙ 去设置（填密钥）</button>
+  </div>
+  <span id="scanMsg"></span>
+  <p style="margin-top:20px;margin-bottom:0">扫描完成、打了分之后回到本页就能看到照片卡片。</p>
+</div>
+<script>
+async function startScan(){
+  const msg = document.getElementById('scanMsg');
+  const btn = document.querySelector('button.primary');
+  if(msg) msg.textContent = '正在启动…';
+  if(btn){ btn.disabled = true; }
+  try{
+    const r = await fetch('/api/scan/start', {method:'POST'});
+    const j = await r.json();
+    if(msg) msg.textContent = (j.ok ? '✅ 已开始扫描（正在后台处理）' : (j.msg || '未开始'));
+  }catch(e){ if(msg) msg.textContent = '启动失败: '+e; }
+  setTimeout(()=>{ location.reload(); }, 15000);   // 15 秒后自动刷新看进度
+}
+</script>
+</body>
+</html>"""
+
 
 def build_html(rows, page: int, page_size: int, total_count: int):
     items_html = []
@@ -2350,6 +2409,22 @@ def api_scan_stop():
     return Response(json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False), mimetype="application/json")
 
 
+@app.get("/api/scan/progress")
+def api_scan_progress():
+    """返回扫描实时进度（analyze 写到 PROGRESS_FILE 的 JSON）。未在扫描则返回 running=false。"""
+    _require_webui_enabled()
+    running = scheduler.is_analyze_running()
+    data: dict = {"running": bool(running)}
+    if PROGRESS_FILE.exists():
+        try:
+            raw = json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                data["progress"] = raw
+        except Exception:
+            pass
+    return Response(json.dumps(data, ensure_ascii=False), mimetype="application/json")
+
+
 @app.get("/api/quotas")
 def api_quotas():
     _require_webui_enabled()
@@ -2439,6 +2514,7 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 .q-note{font-size:12px;color:var(--muted);margin-top:6px}
 .bar{flex:1;height:12px;background:var(--line);border-radius:6px;overflow:hidden}
 .bar .fill{height:100%;border-radius:6px;transition:width .3s}
+.bar-fill{height:100%;border-radius:6px;background:linear-gradient(90deg,#3fb58a,#54d6a4);transition:width .3s}
 .bar .fill.success{background:linear-gradient(90deg,#3fb58a,#54d6a4)}
 .bar .fill.warn{background:linear-gradient(90deg,#e0a83c,#f0c060)}
 .bar .fill.err{background:linear-gradient(90deg,#d65757,#f07b7b)}
@@ -2476,7 +2552,11 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
   <button type="button" id="scanStopBtn" onclick="stopScan()">■ 停止扫描</button>
   <span class="subtitle" id="scanMsg" style="margin:0"></span>
 </div>
-<div class="hint" style="margin-bottom:4px">「现在扫描」= 立刻按当前规则把相册里没打过分的新照片扫一遍（不受空闲时段限制）。</div>
+<div id="scanProgressBox" style="display:none;margin:8px 0;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;">
+  <div class="quota-row"><span class="q-label">扫描进度</span><div class="bar"><div class="bar-fill" id="scanProgressFill" style="width:0%"></div></div><span class="q-pct" id="scanProgressPct">0%</span></div>
+  <div class="q-note" id="scanProgressNote">正在扫描…</div>
+</div>
+<div class="hint" style="margin-bottom:4px">「现在扫描」= 立刻按当前规则把相册里没打过分的新照片扫一遍（不受空闲时段限制），下方会显示实时进度。</div>
 <div class="statusline" id="statusBox">尚未查看调度状态</div>
 </details>
 
@@ -2756,7 +2836,42 @@ async function refreshStatus(){
     const stopBtn = document.getElementById('scanStopBtn');
     if(startBtn){ startBtn.disabled = running; startBtn.textContent = running ? '⏳ 扫描中…' : '▶ 现在扫描'; }
     if(stopBtn){ stopBtn.disabled = !running; }
+    refreshScanProgress(running);
   }catch(e){ box.textContent = '查询失败: '+e; }
+}
+
+// 扫描进度：轮询 /api/scan/progress，更新进度条与文案
+let _scanProgressTimer = null;
+async function refreshScanProgress(running){
+  const box = document.getElementById('scanProgressBox');
+  const fill = document.getElementById('scanProgressFill');
+  const pct = document.getElementById('scanProgressPct');
+  const note = document.getElementById('scanProgressNote');
+  if(!running){
+    if(box) box.style.display = 'none';
+    if(_scanProgressTimer){ clearInterval(_scanProgressTimer); _scanProgressTimer = null; }
+    return;
+  }
+  if(box) box.style.display = 'block';
+  try{
+    const r = await getJSON('/api/scan/progress');
+    const p = (r && r.progress) || null;
+    if(p){
+      if(fill) fill.style.width = Math.min(100, Math.max(0, p.percent||0)) + '%';
+      if(pct) pct.textContent = (p.percent||0) + '%';
+      if(note){
+        note.textContent = '已处理 ' + (p.done||0) + '/' + (p.total||0) + (p.current ? '　正在：'+basename(p.current) : '');
+      }
+    }
+  }catch(e){ /* 轮询失败静默 */ }
+  // 每 1.5 秒刷一次进度
+  if(!_scanProgressTimer){
+    _scanProgressTimer = setInterval(()=>{ refreshScanProgress(true); }, 1500);
+  }
+}
+function basename(p){
+  if(!p) return '';
+  return String(p).split(/[\\/]/).pop();
 }
 
 async function startScan(){
@@ -2798,11 +2913,7 @@ def review():
 
     rows, total_count = load_rows(page=page, page_size=REVIEW_PAGE_SIZE, md=md, sort=sort)
     if not rows:
-        return Response(
-            "数据库里没有可展示的数据。请先运行你的分析脚本生成评分与文案。",
-            status=404,
-            mimetype="text/plain; charset=utf-8",
-        )
+        return Response(_build_empty_review_html(), mimetype="text/html; charset=utf-8")
 
     html_str = build_html(rows, page=page, page_size=REVIEW_PAGE_SIZE, total_count=total_count)
     return Response(html_str, mimetype="text/html; charset=utf-8")
