@@ -32,13 +32,15 @@ from converter import (
 # 任务进度上报（供 Web 页面轮询显示）
 # =======================
 # 进度文件路径由 server 拉起子进程时用环境变量注入（命令行直接跑则留空，静默跳过）。
-# 扫描与去重各写各的文件 —— 共用一份的话，去重跑到一半会被扫描的进度覆盖掉，
-# 页面上的百分比就会莫名其妙地跳。
-SCAN_PROGRESS_FILE = os.environ.get("INKTIME_PROGRESS_FILE", "")
-DEDUPE_PROGRESS_FILE = os.environ.get("INKTIME_DEDUPE_PROGRESS_FILE", "")
+#
+# 只用【一个】环境变量，由 server 按任务名挑文件：一次进程只跑一种模式（扫描 /
+# 去重 / 刷地名），谁写哪个文件不需要在这里区分。早先扫描和去重各占一个变量，
+# 三条拉起子进程的路径各注各的，漏了一条 —— 去重的进度就静默地永远不写，
+# 点下去看着像没反应。合成一个变量后就没有"漏注入"这回事了。
+PROGRESS_FILE = os.environ.get("INKTIME_PROGRESS_FILE", "")
 
-# 去重起始时刻（main 的去重分支设置），用来在进度里带上已用时与预计剩余。
-_DEDUPE_T0: float = 0.0
+# 任务起始时刻（main 的对应分支设置），用来在进度里带上已用时与预计剩余。
+_TASK_T0: float = 0.0
 
 
 def _write_progress(path_str: str, payload: dict) -> None:
@@ -65,7 +67,7 @@ def report_scan_progress(
 ) -> None:
     """扫描进度：每处理一张报一次。"""
     pct = (done / total) if total > 0 else 0.0
-    _write_progress(SCAN_PROGRESS_FILE, {
+    _write_progress(PROGRESS_FILE, {
         "done": done,
         "total": total,
         "percent": round(100.0 * pct, 1),
@@ -75,7 +77,7 @@ def report_scan_progress(
     })
 
 
-def report_dedupe_progress(
+def report_task_progress(
     done: int,
     total: int,
     phase: str = "",
@@ -85,9 +87,9 @@ def report_dedupe_progress(
     status: str = "running",
     extra: dict | None = None,
 ) -> None:
-    """去重进度。
+    """分段任务的进度（去重、刷地名这类"跑完还要留个结果"的活）。
 
-    percent 是【当前这一层】的完成度，不是整个任务的。去重四层各自的总量差着
+    percent 是【当前这一段】的完成度，不是整个任务的。去重四层各自的总量差着
     几个数量级（列目录要过 8000 个文件，感知哈希往往只剩几十张），硬折算成一个
     总百分比只会得到假的精确度 —— 条走到 80% 不代表快完了。所以另给
     stage/stages，由页面显示「第 2/4 步 比对文件内容」，把"走到哪了"交给步数说。
@@ -96,7 +98,7 @@ def report_dedupe_progress(
     所以结束时【不清】这个文件，否则跑完那一刻的信息就永远看不到了。
     """
     pct = (done / total) if total > 0 else 0.0
-    elapsed = (time.time() - _DEDUPE_T0) if _DEDUPE_T0 else 0.0
+    elapsed = (time.time() - _TASK_T0) if _TASK_T0 else 0.0
     eta = None
     if status == "running" and done > 0 and total > done and elapsed > 3:
         eta = elapsed / done * (total - done)
@@ -118,15 +120,15 @@ def report_dedupe_progress(
     }
     if extra:
         payload.update(extra)
-    _write_progress(DEDUPE_PROGRESS_FILE, payload)
+    _write_progress(PROGRESS_FILE, payload)
 
 
 def clear_scan_progress() -> None:
     """扫描结束后清除进度文件，让前端回到『未在扫描』状态。"""
-    if not SCAN_PROGRESS_FILE:
+    if not PROGRESS_FILE:
         return
     try:
-        Path(SCAN_PROGRESS_FILE).unlink(missing_ok=True)
+        Path(PROGRESS_FILE).unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -1155,6 +1157,76 @@ def load_dup_map(conn: sqlite3.Connection) -> dict:
         return {}          # 表还没建（从未跑过去重）
 
 
+def _gps_from_exif_json(exif_json) -> tuple:
+    """从 exif_json 里兜底取 (lat, lon)，取不到返回 (None, None)。
+
+    exif_gps_lat/lon 两列是后来 ALTER 加的，更早入库的行是 NULL，但那一列 JSON
+    里存着当时读到的完整 EXIF（含 gps_lat/gps_lon）。不兜这一层的话，早期照片的
+    地名永远刷不新 —— 而那些恰恰是最需要更新的存量。
+    """
+    if not exif_json or not isinstance(exif_json, str):
+        return (None, None)
+    try:
+        d = json.loads(exif_json)
+    except Exception:
+        return (None, None)
+    if not isinstance(d, dict):
+        return (None, None)
+    lat, lon = d.get("gps_lat"), d.get("gps_lon")
+    if lat is None or lon is None:
+        return (None, None)
+    try:
+        return (float(lat), float(lon))
+    except (TypeError, ValueError):
+        return (None, None)
+
+
+def refresh_cities(conn: sqlite3.Connection, progress_cb=None) -> dict:
+    """用当前的城市库重算 exif_city。不调 VLM、不重新打分。
+
+    拍摄地点只取决于「GPS 坐标 + 本地城市库」两样，都在手上 —— 换城市库之后
+    没道理为了改个地名把 8000 张照片重新送一遍大模型（几小时 + 一大笔额度）。
+    这里只 UPDATE 一列，几秒钟的事。
+
+    没有 GPS 的照片恒为空，不参与：换什么库都救不回来，如实计入 no_gps，
+    免得用户以为是刷失败了。
+    """
+    resolve = get_city_resolver()
+    cur = conn.cursor()
+
+    # 很旧的库可能还没有 gps 两列（ALTER 迁移是后加的）
+    try:
+        cur.execute("SELECT exif_gps_lat, exif_gps_lon FROM photo_scores LIMIT 1")
+        gps_cols = "exif_gps_lat, exif_gps_lon"
+    except sqlite3.OperationalError:
+        gps_cols = "NULL, NULL"
+
+    rows = cur.execute(
+        f"SELECT path, {gps_cols}, exif_json, exif_city FROM photo_scores").fetchall()
+
+    total = len(rows)
+    with_gps = updated = 0
+    for i, (path, lat, lon, exif_json, old) in enumerate(rows, 1):
+        if lat is None or lon is None:
+            lat, lon = _gps_from_exif_json(exif_json)
+        if lat is not None and lon is not None:
+            with_gps += 1
+            new = resolve(lat, lon)
+            if new != (old or ""):
+                cur.execute("UPDATE photo_scores SET exif_city = ? WHERE path = ?",
+                            (new, path))
+                updated += 1
+        if i % 200 == 0 or i == total:
+            if progress_cb:
+                try:
+                    progress_cb(i, total, "重算拍摄地点")
+                except Exception:
+                    pass      # 进度上报失败不该拖垮重算本身
+    conn.commit()
+    return {"total": total, "with_gps": with_gps, "updated": updated,
+            "no_gps": total - with_gps}
+
+
 def open_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     """统一的 photos.db 连接（含 WAL 与锁等待）。
 
@@ -2075,7 +2147,14 @@ def main():
                         help="只建立/更新去重索引并标记重复项，不调用 VLM 打分（可独立 cron 调度）")
     parser.add_argument("--dedupe-reindex", action="store_true",
                         help="配合 --dedupe-only：忽略已有索引全部重算（默认只补未索引/文件已变的）")
+    parser.add_argument("--refresh-cities", action="store_true",
+                        help="只重算库里的拍摄地点（exif_city），不读文件、不调 VLM、不重新打分"
+                             "—— 换了城市库之后刷这个即可，不必重扫相册")
     args = parser.parse_args()
+
+    # 只声明一次（去重 / 刷地名两个分支都要写它）。Python 不允许同一个名字在
+    # 使用之后再出现第二次 global —— 所以统一提到最前面。
+    global _TASK_T0
 
     # 应用 Web 设置页保存的动态配置（API key / 屏幕 / 阈值），并重建渠道状态
     try:
@@ -2115,6 +2194,36 @@ def main():
     filelist_path = tmp_dir / "filelist.txt"
     cache_path = tmp_dir / ".filelist_cache.txt"
 
+    # ---------- 只重算拍摄地点：换了城市库之后不必重扫相册 ----------
+    # 刻意放在列目录【之前】：这个任务只读数据库里的坐标，跟磁盘上的文件无关，
+    # 走一遍 rglob 纯属浪费（相册在 NAS 上时那是好几分钟）。
+    def _city_progress(done: int, total: int, phase: str) -> None:
+        report_task_progress(done, total, phase, stages=1)
+
+    if args.refresh_cities:
+        _TASK_T0 = time.time()
+        report_task_progress(0, 0, "准备重算拍摄地点", stages=1)
+        conn_city = open_db()
+        ensure_table(conn_city)
+        try:
+            cs = refresh_cities(conn_city, progress_cb=_city_progress)
+            print(f"[OK] 拍摄地点重算完成，用时 {time.time() - _TASK_T0:.1f}s："
+                  f"库内 {cs['total']} 张 / 有坐标 {cs['with_gps']} 张 / "
+                  f"地名更新 {cs['updated']} 张（其余无 GPS 坐标，改不了）")
+            report_task_progress(
+                cs["with_gps"] or 0, cs["with_gps"] or 0, "已完成",
+                stages=1,          # 单段任务：前端据此不显示"第 1/1 步"
+                status="done",
+                extra={
+                    "finished_at": dt.datetime.now().isoformat(timespec="seconds"),
+                    "stats": {k: int(cs.get(k) or 0) for k in
+                              ("total", "with_gps", "updated", "no_gps")},
+                },
+            )
+        finally:
+            conn_city.close()
+        return
+
     if args.cache:
         print("[WARN] --cache 仅建议用于调试提速，不适合生产环境。")
         print("[WARN] 使用缓存会跳过目录重扫：新增照片不会被发现，已删除照片的旧记录也可能保留在数据库中。")
@@ -2123,9 +2232,8 @@ def main():
     # 把这部分排除在外，页面上的"已用时"会比用户实际等的时间短一截。
     _dd_stages = 4 if bool(getattr(cfg, "DEDUPE_SIMILAR_ENABLED", True)) else 3
     if args.dedupe_only:
-        global _DEDUPE_T0
-        _DEDUPE_T0 = time.time()
-        report_dedupe_progress(0, 0, "正在枚举照片文件", stage=1, stages=_dd_stages)
+        _TASK_T0 = time.time()
+        report_task_progress(0, 0, "正在枚举照片文件", stage=1, stages=_dd_stages)
 
     _listed = {"reported": False}
 
@@ -2133,7 +2241,7 @@ def main():
         # 列目录不在下面任何一层的统计里，单独报，否则点了按钮会长时间毫无动静
         _listed["reported"] = True
         if args.dedupe_only:
-            report_dedupe_progress(scanned, 0, "正在枚举照片文件",
+            report_task_progress(scanned, 0, "正在枚举照片文件",
                                    stage=1, stages=_dd_stages)
         else:
             report_scan_progress(scanned, 0, phase="list",
@@ -2245,13 +2353,13 @@ def main():
         # "已发现 7500 个文件" 突然跌回 0%，看着像出错了。只有相册很小、
         # 枚举快到没触发回调时，才需要这一份来让页面立刻有东西显示。
         if not _listed["reported"]:
-            report_dedupe_progress(0, len(imgs), "准备读取拍摄信息",
+            report_task_progress(0, len(imgs), "准备读取拍摄信息",
                                    stage=1, stages=_dd_stages)
         t_dedupe = time.time()
 
         def _dedupe_progress(done: int, total_: int, phase: str,
                              stage: int, stages: int) -> None:
-            report_dedupe_progress(done, total_, phase, stage=stage, stages=stages)
+            report_task_progress(done, total_, phase, stage=stage, stages=stages)
 
         stats = run_dedupe(
             conn, imgs,
@@ -2269,7 +2377,7 @@ def main():
         # 收尾写一份 status=done 的快照（带统计），页面据此显示"上次重建的结果"。
         # 这里刻意【不】清进度文件 —— 清掉的话，跑完那一刻的信息就再也看不到了，
         # 而用户多半是过一阵子才回来看结果的。
-        report_dedupe_progress(
+        report_task_progress(
             len(imgs), len(imgs), "已完成", stage=_dd_stages, stages=_dd_stages,
             status="done",
             extra={

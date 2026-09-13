@@ -67,11 +67,28 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 PROGRESS_FILE = Path(os.environ.get("INKTIME_PROGRESS_FILE", str(LOG_DIR / "scan_progress.json"))).expanduser()
 PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-# 去重进度用【单独一份】文件：扫描与去重是两个互不相干的进程，共用一个文件的话
+# 去重与"刷地名"各用【单独一份】进度文件：它们是互不相干的进程，共用一个文件的话
 # 后写的会把先写的整个覆盖掉，页面上的百分比就会莫名其妙地跳。
 DEDUPE_PROGRESS_FILE = Path(os.environ.get(
     "INKTIME_DEDUPE_PROGRESS_FILE", str(LOG_DIR / "dedupe_progress.json"))).expanduser()
 DEDUPE_PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+CITIES_PROGRESS_FILE = Path(os.environ.get(
+    "INKTIME_CITIES_PROGRESS_FILE", str(LOG_DIR / "cities_progress.json"))).expanduser()
+CITIES_PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+def progress_file_for(name: str) -> Path:
+    """任务名 → 它该写的进度文件。
+
+    子进程那边只有一个 INKTIME_PROGRESS_FILE，由这里按任务挑 —— 一次进程只跑
+    一种模式，所以不需要子进程自己去区分。现取现用、不缓存：缓存住的话，谁改了
+    上面那几个常量这里还照着旧的走，注入的路径和接口读的路径就对不上了。
+    """
+    if name == "dedupe":
+        return DEDUPE_PROGRESS_FILE
+    if name == "cities":
+        return CITIES_PROGRESS_FILE
+    return PROGRESS_FILE
 
 # ---- Token 感知调度参数（来自 config.py / 设置页 quota 段） ----
 # 这些是 import 时从 cfg 读的快照；设置页保存后经 _refresh_quota_globals() 同步（见该函数）。
@@ -340,19 +357,19 @@ class Scheduler:
             "scan_running": self.is_analyze_running(),
             "render_running": self.is_render_running(),
             "dedupe_running": self.is_dedupe_running(),
+            "cities_running": self.is_cities_running(),
         }
 
     @staticmethod
-    def _job_env() -> dict:
-        """子进程环境：把两个进度文件路径都注入进去。
+    def _job_env(name: str) -> dict:
+        """子进程环境：把【这个任务】的进度文件路径注入进去。
 
-        两个都给：扫描读 INKTIME_PROGRESS_FILE，去重读 INKTIME_DEDUPE_PROGRESS_FILE。
-        三个拉起子进程的地方（cron、手动扫描、手动任务）都从这里取，免得像
-        之前那样漏掉一处，去重的进度就静默地永远不写。
+        按任务名挑文件，子进程只有一个变量要认。原先扫描和去重各占一个变量、
+        几条拉起子进程的路径各注各的，结果漏了一条 —— 去重的进度就静默地永远
+        不写，点下去像没反应。合成一个变量之后，没有"漏注入"这回事了。
         """
         env = dict(os.environ)
-        env["INKTIME_PROGRESS_FILE"] = str(PROGRESS_FILE)
-        env["INKTIME_DEDUPE_PROGRESS_FILE"] = str(DEDUPE_PROGRESS_FILE)
+        env["INKTIME_PROGRESS_FILE"] = str(progress_file_for(name))
         return env
 
     def _spawn(self, job: dict, now: datetime) -> None:
@@ -365,7 +382,7 @@ class Scheduler:
             return
 
         cmd = list(job["cmd"])
-        env = self._job_env()
+        env = self._job_env(name)
 
         if job.get("quota_gated"):
             # token 门控：返回 (ok, batch, reason)，batch 由剩余额度估算
@@ -437,7 +454,7 @@ class Scheduler:
             msg = "已开始【重新扫描】，将重新打分已入库照片（" + msg.replace("已开始扫描，", "")
 
         # 注入估算的批量 + 可选重扫标记
-        env = self._job_env()
+        env = self._job_env("analyze")
         env["INKTIME_BATCH_LIMIT"] = str(batch)
         if rescan:
             env["INKTIME_RESCAN"] = "1"
@@ -487,6 +504,10 @@ class Scheduler:
         p = self._proc.get("dedupe")
         return p is not None and p.poll() is None
 
+    def is_cities_running(self) -> bool:
+        p = self._proc.get("cities")
+        return p is not None and p.poll() is None
+
     def start_job_manual(self, name: str, extra_args: list[str] | None = None,
                          msg_ok: str = "已开始") -> tuple[bool, str]:
         """手动拉起某个 job（网页按钮用）。
@@ -503,7 +524,7 @@ class Scheduler:
             return False, "该任务正在运行，请稍候"
 
         cmd = list(job["cmd"]) + list(extra_args or [])
-        env = self._job_env()
+        env = self._job_env(name)
         log_path = LOG_DIR / job["log"]
         now = datetime.now()
         shell_cmd = f"{shlex.join(cmd)} 2>&1 | tee -a {shlex.quote(str(log_path))}"
@@ -530,6 +551,29 @@ class Scheduler:
         """网页点「重建去重索引」：跑一次 analyze_photos.py --dedupe-only。"""
         return self.start_job_manual(
             "dedupe", None, "已开始重建去重索引（首次全量较慢，之后是增量）")
+
+    def start_cities_manual(self) -> tuple[bool, str]:
+        """网页点「刷新拍摄地点」：只重算 exif_city。
+
+        不是 cron job（没有定时需求，且只在换过城市库之后才需要跑），所以不走
+        start_job_manual —— 那条路要求任务得先在 jobs 列表里注册。这里直接用
+        _proc["cities"] 这个槽位做互斥。
+        """
+        p = self._proc.get("cities")
+        if p is not None and p.poll() is None:
+            return False, "正在刷新拍摄地点，请稍候"
+        cmd = [sys.executable, str(ROOT_DIR / "analyze_photos.py"), "--refresh-cities"]
+        env = self._job_env("cities")
+        log_path = LOG_DIR / "cities.log"
+        shell_cmd = f"{shlex.join(cmd)} 2>&1 | tee -a {shlex.quote(str(log_path))}"
+        print(f"[{datetime.now():%F %T}] [scheduler] 手动启动 cities")
+        proc = subprocess.Popen(
+            ["sh", "-c", shell_cmd],
+            cwd=str(ROOT_DIR), env=env, start_new_session=True,
+        )
+        with self._lock:
+            self._proc["cities"] = proc
+        return True, "已开始刷新拍摄地点（只算地名，不消耗额度）"
 
     def stop_render_manual(self) -> tuple[bool, str]:
         p = self._proc.get("render")
@@ -1173,35 +1217,46 @@ function _taskDur(sec){
   return Math.floor(m / 60) + ' 小时 ' + (m % 60) + ' 分';
 }
 
+// 哪个任务在跑就显示哪个（同时跑多个时按下面的顺序取第一个）
+var _TASKS = [
+  {flag: 'scan_running',   url: '/api/scan/progress',   scan: true,
+   title: '⏳ 后台任务运行中 · 正在扫描照片'},
+  {flag: 'dedupe_running', url: '/api/dedupe/progress', scan: false,
+   title: '🔍 后台任务运行中 · 正在重建去重索引'},
+  {flag: 'cities_running', url: '/api/cities/progress', scan: false,
+   title: '📍 后台任务运行中 · 正在刷新拍摄地点'}
+];
+
 function pollGlobalTasks(){
   var bar = document.getElementById('globalTaskBar');
   if (!bar) return;
   fetch('/api/status').then(function(r){ return r.json(); }).then(function(st){
-    if (st.scan_running) {
-      fetch('/api/scan/progress').then(function(r){ return r.json(); }).then(function(p){
-        var pp = (p && p.progress) || {};
+    var task = null;
+    for (var i = 0; i < _TASKS.length; i++) {
+      if (st[_TASKS[i].flag]) { task = _TASKS[i]; break; }
+    }
+    if (!task) { bar.style.display = 'none'; return; }
+    fetch(task.url).then(function(r){ return r.json(); }).then(function(p){
+      var pp = (p && p.progress) || {};
+      var detail;
+      if (task.scan) {
         var cur = pp.current ? String(pp.current).split(/[\\/]/).pop() : '';
         var amt = (pp.total > 0)
           ? ('已处理 ' + (pp.done||0) + '/' + pp.total)
           : ('正在枚举文件，已发现 ' + (pp.done||0) + ' 个');
-        _taskBarRender(bar, '⏳ 后台任务运行中 · 正在扫描照片', pp.percent || 0, amt + (cur ? ' · ' + cur : ''));
-      }).catch(function(){});
-    } else if (st.dedupe_running) {
-      fetch('/api/dedupe/progress').then(function(r){ return r.json(); }).then(function(p){
-        var pp = (p && p.progress) || {};
+        detail = amt + (cur ? ' · ' + cur : '');
+      } else {
         // 进程刚拉起、还没写出第一份进度时 pp 是空的：这时别写"处理中"（等于没说），
         // 明说"正在启动" —— 大相册光 import + 列目录就要一会儿。
-        var stg = pp.stage ? ('第 ' + pp.stage + '/' + (pp.stages || 4) + ' 步 · ') : '';
-        var who = pp.phase || (pp.stage ? '' : '正在启动，请稍候…');
-        var amt = (pp.total > 0) ? ((pp.done||0) + '/' + pp.total)
-                                 : (pp.done ? ('已发现 ' + pp.done + ' 个文件') : '');
+        var stg = ((pp.stages || 0) > 1) ? ('第 ' + pp.stage + '/' + pp.stages + ' 步 · ') : '';
+        var amt2 = (pp.total > 0) ? ((pp.done||0) + '/' + pp.total)
+                                  : (pp.done ? ('已处理 ' + pp.done + ' 张') : '');
         var eta = pp.eta ? ('　预计还需 ' + _taskDur(pp.eta)) : '';
-        _taskBarRender(bar, '🔍 后台任务运行中 · 正在重建去重索引', pp.percent || 0,
-                       stg + who + (amt ? '　' + amt : '') + eta);
-      }).catch(function(){});
-    } else {
-      bar.style.display = 'none';
-    }
+        detail = stg + (pp.phase || '正在启动，请稍候…') +
+                 (amt2 ? '　' + amt2 : '') + eta;
+      }
+      _taskBarRender(bar, task.title, pp.percent || 0, detail);
+    }).catch(function(){});
   }).catch(function(){});
   setTimeout(pollGlobalTasks, 2000);
 }
@@ -2983,6 +3038,18 @@ def api_dedupe_start():
     return Response(json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False), mimetype="application/json")
 
 
+@app.post("/api/cities/start")
+def api_cities_start():
+    """网页点「刷新拍摄地点」：只重算库里的 exif_city。
+
+    不读文件、不调 VLM、不重新打分 —— 换了城市库之后刷这个就够了，
+    没必要为了改个地名把整个相册重新送一遍大模型。
+    """
+    _require_webui_enabled()
+    ok, msg = scheduler.start_cities_manual()
+    return Response(json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False), mimetype="application/json")
+
+
 @app.get("/api/device")
 def api_device():
     """相框设备的最后上线 / 拉取记录。
@@ -3009,24 +3076,43 @@ def api_scan_progress():
     return Response(json.dumps(data, ensure_ascii=False), mimetype="application/json")
 
 
-@app.get("/api/dedupe/progress")
-def api_dedupe_progress():
-    """去重进度 + 上一次的结果。
+def _task_progress_payload(progress_file: Path, running: bool) -> dict:
+    """分段任务的进度响应（去重 / 刷地名共用）。
 
-    running 以【进程状态】为准，文件里的 status 只说明上一次跑到哪：
-    进程没了、文件却还停在 status="running"，那就是中途被中断或崩了 ——
-    如实标成 interrupted，而不是傻等一个永远不会更新的百分比。
-    跑完的那份快照会一直留着（analyze 结束时不删），页面据此显示上次的统计。
+    running 以【进程状态】为准，文件里的 status 只说明上一次跑到哪：进程没了、
+    文件却还停在 status="running"，那就是中途被中断或崩了 —— 如实标成
+    interrupted，而不是让页面傻等一个永远不会更新的百分比。跑完的那份快照会一直
+    留着（analyze 结束时不删），页面据此显示上次的统计。
     """
-    _require_webui_enabled()
-    running = scheduler.is_dedupe_running()
     data: dict = {"running": bool(running)}
-    snap = _read_progress_file(DEDUPE_PROGRESS_FILE)
+    snap = _read_progress_file(progress_file)
     if snap:
         if not running and snap.get("status") == "running":
             snap["interrupted"] = True
         data["progress"] = snap
-    return Response(json.dumps(data, ensure_ascii=False), mimetype="application/json")
+    return data
+
+
+@app.get("/api/dedupe/progress")
+def api_dedupe_progress():
+    """去重进度 + 上一次的结果。"""
+    _require_webui_enabled()
+    return Response(
+        json.dumps(_task_progress_payload(DEDUPE_PROGRESS_FILE,
+                                          scheduler.is_dedupe_running()),
+                   ensure_ascii=False),
+        mimetype="application/json")
+
+
+@app.get("/api/cities/progress")
+def api_cities_progress():
+    """刷新拍摄地点的进度 + 上一次的结果。"""
+    _require_webui_enabled()
+    return Response(
+        json.dumps(_task_progress_payload(CITIES_PROGRESS_FILE,
+                                          scheduler.is_cities_running()),
+                   ensure_ascii=False),
+        mimetype="application/json")
 
 
 @app.get("/api/quotas")
@@ -3217,12 +3303,16 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 <div class="kv"><label>连拍时间间隔（秒）</label><input type="text" id="cfg_dedupe_burst_gap" placeholder="3"></div>
 <div class="kv"><label>选片排除天数</label><input type="text" id="cfg_recent_days" placeholder="30"></div>
 <div class="hint">▲ 每天出图时跳过最近这么多天内已经上过屏的照片，避免连着几天推同一批。</div>
-<div class="kv"><label>去重索引</label><span style="grid-column:2/-1"><button type="button" onclick="rebuildDedupe()">🔍 立即重建去重索引</button></span></div>
+<div class="kv"><label>照片维护</label><span style="grid-column:2/-1;display:flex;gap:8px;flex-wrap:wrap">
+  <button type="button" onclick="rebuildDedupe()">🔍 重建去重索引</button>
+  <button type="button" onclick="refreshCities()">📍 刷新拍摄地点</button>
+</span></div>
 <div class="q-note" id="dedupe_note" style="display:none"></div>
-<div class="q-note" style="opacity:.7">首次全量重建要读遍相册里的每个文件，大相册可能要几十分钟；之后是增量，很快。</div>
-<div id="dedupeProgressBox" style="display:none;margin:10px 0;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;">
-  <div class="quota-row"><span class="q-label" id="dedupeStage">准备中…</span><div class="bar"><div class="bar-fill" id="dedupeFill" style="width:0%"></div></div><span class="q-pct" id="dedupePct">0%</span></div>
-  <div class="q-note" id="dedupeDetail"></div>
+<div class="q-note" id="cities_note" style="display:none"></div>
+<div class="q-note" style="opacity:.7">「重建去重索引」首次全量要读遍相册里的每个文件，大相册可能要几十分钟；之后是增量，很快。<br>「刷新拍摄地点」只按库里已有的 GPS 坐标重算地名，几秒钟，不必重扫相册、不消耗额度。</div>
+<div id="maintProgressBox" style="display:none;margin:10px 0;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;">
+  <div class="quota-row"><span class="q-label" id="maintStage">准备中…</span><div class="bar"><div class="bar-fill" id="maintFill" style="width:0%"></div></div><span class="q-pct" id="maintPct">0%</span></div>
+  <div class="q-note" id="maintDetail"></div>
 </div>
 </details>
 
@@ -3557,10 +3647,30 @@ async function doNext(){
     note.textContent = '换一张失败：' + e;
   }
 }
-// 去重索引：点按钮后每 2 秒轮询进度，跑完显示统计。
-// 进度文件在跑完后【不删】，所以隔天再打开这一页，仍能看到上次重建的结果。
-let _dedupeTimer = null;
-const DEDUPE_STAGE_ZH = {1:'读取拍摄信息', 2:'比对文件内容', 3:'划定候选范围', 4:'比对感知哈希'};
+// —— 后台维护任务：重建去重索引 / 刷新拍摄地点 ——
+// 两个任务共用一条进度条（同一时刻只会跑一个，分成两条反而要在两处找），
+// 但各自留一行「上次结果」。进度文件跑完【不删】，所以隔天再打开这页仍看得到。
+const MAINT = {
+  dedupe: {
+    name: '重建去重索引',
+    url: '/api/dedupe/progress', start: '/api/dedupe/start', note: 'dedupe_note',
+    stages: {1:'读取拍摄信息', 2:'比对文件内容', 3:'划定候选范围', 4:'比对感知哈希'},
+    result: (s, when, dur) => '✅ 上次重建' + when + '：共索引 ' + (s.indexed || 0)
+      + ' 张、用时 ' + dur + '；标记重复 ' + (s.duplicates || 0) + ' 张（内容相同 '
+      + (s.exact || 0) + '、连拍 ' + (s.burst || 0) + '、视觉相似 ' + (s.similar || 0) + '）',
+  },
+  cities: {
+    name: '刷新拍摄地点',
+    url: '/api/cities/progress', start: '/api/cities/start', note: 'cities_note',
+    stages: {},
+    result: (s, when, dur) => '✅ 上次刷新' + when + '：库内 ' + (s.total || 0)
+      + ' 张，其中有坐标 ' + (s.with_gps || 0) + ' 张；地名更新 ' + (s.updated || 0)
+      + ' 张、用时 ' + dur
+      + (s.no_gps ? ('（另有 ' + s.no_gps + ' 张照片没有 GPS 坐标，无法判断地点）') : ''),
+  },
+};
+
+let _maintTimer = null;
 
 function fmtDur(sec){
   const s = Math.round(sec || 0);
@@ -3571,71 +3681,89 @@ function fmtDur(sec){
 }
 
 // 状态行默认藏着（没话说时不留空行）；一旦有内容就显出来
-function _dedupeSay(text){
-  const note = document.getElementById('dedupe_note');
-  if(!note) return;
-  note.textContent = text;
-  note.style.display = text ? 'block' : 'none';
+function _say(key, text){
+  const el = document.getElementById(MAINT[key].note);
+  if(!el) return;
+  el.textContent = text;
+  el.style.display = text ? 'block' : 'none';
 }
 
-async function refreshDedupeProgress(){
-  const box = document.getElementById('dedupeProgressBox');
-  const note = document.getElementById('dedupe_note');
-  if(!box || !note) return;
-  let r;
-  try{ r = await getJSON('/api/dedupe/progress'); }catch(e){ return; }
-  const p = (r && r.progress) || null;
+function _maintRender(key, p){
+  const box = document.getElementById('maintProgressBox');
+  if(!box) return;
+  box.style.display = 'block';
+  const def = MAINT[key];
+  // 优先用后端给的 phase：去重第 1 步含"枚举目录"和"读拍摄信息"两小段，
+  // 写死成阶段名的话，明明还在数文件却显示"读取拍摄信息"，是误导。
+  const name = p.phase || def.stages[p.stage] || '处理中';
+  // 单段任务（刷新地点）不显示"第 1/1 步" —— 那句话没有信息量
+  const multi = (p.stages || 0) > 1;
+  document.getElementById('maintStage').textContent =
+    (multi ? ('第 ' + (p.stage || 1) + '/' + p.stages + ' 步 · ') : '') + name;
+  document.getElementById('maintPct').textContent = (p.percent || 0) + '%';
+  document.getElementById('maintFill').style.width = Math.min(100, Math.max(0, p.percent || 0)) + '%';
+  let d = (p.total > 0) ? ((p.done || 0) + ' / ' + p.total)
+                        : (p.done > 0 ? ('已处理 ' + p.done + ' 张') : '');
+  if(p.elapsed) d += (d ? '　' : '') + '已用时 ' + fmtDur(p.elapsed);
+  if(p.eta) d += '　预计还需 ' + fmtDur(p.eta);
+  document.getElementById('maintDetail').textContent = d;
+}
 
-  if(r && r.running && p){
-    box.style.display = 'block';
-    // 优先用后端给的 phase：第 1 步其实含"枚举目录"和"读拍摄信息"两小段，
-    // 写死成阶段名的话，明明还在数文件却显示"读取拍摄信息"，是误导。
-    const name = p.phase || DEDUPE_STAGE_ZH[p.stage] || '处理中';
-    document.getElementById('dedupeStage').textContent =
-      '第 ' + (p.stage || 1) + '/' + (p.stages || 4) + ' 步 · ' + name;
-    document.getElementById('dedupePct').textContent = (p.percent || 0) + '%';
-    document.getElementById('dedupeFill').style.width = Math.min(100, Math.max(0, p.percent || 0)) + '%';
-    let d = (p.total > 0) ? ((p.done || 0) + ' / ' + p.total)
-                          : (p.done > 0 ? ('已发现 ' + p.done + ' 个文件') : '');
-    if(p.elapsed) d += (d ? '　' : '') + '已用时 ' + fmtDur(p.elapsed);
-    if(p.eta) d += '　预计还需 ' + fmtDur(p.eta);
-    document.getElementById('dedupeDetail').textContent = d;
-    if(!_dedupeTimer) _dedupeTimer = setInterval(refreshDedupeProgress, 2000);
+async function refreshMaint(){
+  const box = document.getElementById('maintProgressBox');
+  if(!box) return;
+  let st;
+  try{ st = await getJSON('/api/status'); }catch(e){ return; }
+
+  const key = st.dedupe_running ? 'dedupe' : (st.cities_running ? 'cities' : null);
+  if(key){
+    let r = null;
+    try{ r = await getJSON(MAINT[key].url); }catch(e){}
+    _maintRender(key, (r && r.progress) || {});
+    if(!_maintTimer) _maintTimer = setInterval(refreshMaint, 2000);
     return;
   }
 
   box.style.display = 'none';
-  if(_dedupeTimer){ clearInterval(_dedupeTimer); _dedupeTimer = null; }
+  if(_maintTimer){ clearInterval(_maintTimer); _maintTimer = null; }
 
-  if(p && p.status === 'done'){
-    const s = p.stats || {};
-    const when = p.finished_at ? new Date(p.finished_at).toLocaleString('zh-CN') : '';
-    _dedupeSay('✅ 上次重建' + (when ? '（' + when + '）' : '') + '：共索引 ' + (s.indexed || 0)
-      + ' 张、用时 ' + fmtDur(p.elapsed) + '；标记重复 ' + (s.duplicates || 0)
-      + ' 张（内容相同 ' + (s.exact || 0) + '、连拍 ' + (s.burst || 0)
-      + '、视觉相似 ' + (s.similar || 0) + '）');
-  } else if(p && p.interrupted){
-    _dedupeSay('⚠ 上次重建没有跑完（进程已退出，详见 logs/dedupe.log），索引可能不完整，建议重跑一次。');
-  } else {
-    _dedupeSay('');
+  // 没在跑：把每个任务各自上一次的结果摆出来（进度文件留着就是为了这个）
+  for(const k of Object.keys(MAINT)){
+    const def = MAINT[k];
+    let r = null;
+    try{ r = await getJSON(def.url); }catch(e){}
+    const p = (r && r.progress) || null;
+    if(p && p.status === 'done'){
+      const when = p.finished_at
+        ? ('（' + new Date(p.finished_at).toLocaleString('zh-CN') + '）') : '';
+      _say(k, def.result(p.stats || {}, when, fmtDur(p.elapsed)));
+    } else if(p && p.interrupted){
+      _say(k, '⚠ 上次' + def.name + '没有跑完（进程已退出，详见 logs/），建议重跑一次。');
+    } else {
+      _say(k, '');
+    }
   }
 }
 
-async function rebuildDedupe(){
-  _dedupeSay('正在启动去重索引…');
+async function _maintStart(key){
+  const def = MAINT[key];
+  _say(key, '正在启动' + def.name + '…');
   try{
-    const r = await getJSON('/api/dedupe/start', {method:'POST'});
-    _dedupeSay(r.msg || (r.ok ? '已开始' : '失败'));
+    const r = await getJSON(def.start, {method:'POST'});
+    _say(key, r.msg || (r.ok ? '已开始' : '失败'));
     if(r.ok){
-      // 先显示进度框，再等子进程写出第一份进度（它要先列一遍目录）
-      const box = document.getElementById('dedupeProgressBox');
+      // 先亮出进度条，再等子进程写出第一份进度
+      const box = document.getElementById('maintProgressBox');
       if(box) box.style.display = 'block';
-      setTimeout(refreshDedupeProgress, 800);
+      setTimeout(refreshMaint, 800);
     }
   }catch(e){
-    _dedupeSay('启动失败：' + e);
+    _say(key, '启动失败：' + e);
   }
 }
+
+function rebuildDedupe(){ return _maintStart('dedupe'); }
+function refreshCities(){ return _maintStart('cities'); }
 
 async function refreshStatus(){
   const box = document.getElementById('statusBox');
@@ -3737,9 +3865,9 @@ async function stopScan(){
 }
 
 initSettings();
-// 去重进度独立于扫描，不在 initSettings 里：进页面就查一次，
+// 维护任务的进度独立于扫描，不在 initSettings 里：进页面就查一次，
 // 正在跑就接上轮询，跑完了就把上次结果摆出来。
-refreshDedupeProgress();
+refreshMaint();
 </script>
 </div>
 </body>
