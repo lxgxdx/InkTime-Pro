@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
 import sqlite3
 import json
 import datetime as dt
@@ -114,6 +115,14 @@ def _get_font(size):
 
 MEMORY_THRESHOLD = float(getattr(cfg, "MEMORY_THRESHOLD", 70.0) or 70.0)
 DAILY_PHOTO_QUANTITY = int(getattr(cfg, "DAILY_PHOTO_QUANTITY", 5) or 5)
+# 选片时优先跳过"最近 N 天已出过图"的照片（软排除：候选不够会自动放宽）。
+# 目的：避免连着几天推同一批 —— 周年纪念那天照片本来就少，没有这个过滤会天天重样。
+RECENT_EXCLUDE_DAYS = int(getattr(cfg, "RECENT_EXCLUDE_DAYS", 30) or 30)
+
+# 最近出过图的路径滚动记录（"换一张"的排除集用它，比翻 manifest 更可靠：
+# 与屏数/方向无关，损坏时只需当作"没有排除项"，不会算错）
+ROTATION_FILE = BIN_OUTPUT_DIR / ".rotation.json"
+ROTATION_KEEP = max(10, DAILY_PHOTO_QUANTITY * 3)
 
 # === 屏幕参数（来自 config.py 的 SCREENS 列表，多分辨率并存） ===
 # 见 config-example.py 里的 SCREENS 说明。每个启用屏会各出一套成品；第一个启用屏为默认屏。
@@ -206,13 +215,22 @@ def load_sim_rows() -> List[Dict[str, Any]]:
     if not DB_PATH.exists():
         raise SystemExit(f"找不到数据库文件: {DB_PATH}")
 
-    conn = sqlite3.connect(DB_PATH)
+    # 延迟 import：避免 render 模块在 server 启动时连带拉起 analyze_photos
+    # 显式传本模块的 DB_PATH —— open_db 默认用 analyze_photos 的库路径，
+    # 两者生产环境相同，但传参才不会在路径被改写时静默连错库。
+    from analyze_photos import open_db, is_ignored
+    conn = open_db(DB_PATH)
     c = conn.cursor()
 
     # crop 列（crop_x/y/w/h + is_meaningful）是新加的；旧库可能没有该列，需检测
     col_names = {r[1] for r in c.execute("PRAGMA table_info(photo_scores)").fetchall()}
     crop_cols = ["crop_x", "crop_y", "crop_w", "crop_h", "is_meaningful"]
-    sel_crop = ", ".join(col_names & set(crop_cols)) or "NULL AS crop_x"
+    # ⚠️ 必须按 crop_cols 的固定顺序展开，缺失的补 NULL AS <col>。
+    # 曾用 col_names & set(crop_cols)：集合交集顺序随 PYTHONHASHSEED 每次进程都不同，
+    # 而下面回填是按 crop_cols 固定顺序 zip 的 → 列值整体错位（crop_x 拿到 crop_h 的值），
+    # 其中 is_meaningful 会拿到浮点 crop 值，而判断是 != 0，浮点恒真 →
+    # AI 判定的"无意义"照片此前一直没被过滤掉。
+    sel_crop = ", ".join(c if c in col_names else f"NULL AS {c}" for c in crop_cols)
 
     rows = c.execute(
         f"""
@@ -223,6 +241,8 @@ def load_sim_rows() -> List[Dict[str, Any]]:
                exif_gps_lat,
                exif_gps_lon,
                exif_city,
+               used_at,
+               used_count,
                {sel_crop}
         FROM photo_scores
         WHERE exif_json IS NOT NULL
@@ -232,14 +252,15 @@ def load_sim_rows() -> List[Dict[str, Any]]:
 
     items: List[Dict[str, Any]] = []
     for row in rows:
-        path, exif_json, side_caption, memory_score, gps_lat, gps_lon, exif_city = row[:7]
-        # 第 8 列起是 crop 字段（按 sel_crop 顺序）
-        crop_vals = row[7:]
+        (path, exif_json, side_caption, memory_score, gps_lat, gps_lon, exif_city,
+         used_at, used_count) = row[:9]
+        # 第 10 列起是 crop 字段（按 sel_crop 固定顺序）
+        crop_vals = row[9:]
         date_str = extract_date_from_exif(exif_json)
         if not date_str:
             continue
-        # 再次兜底过滤 Screenshot 等
-        if "screenshot" in str(path).lower():
+        # 再次兜底过滤：截图 / NAS 缩略图目录（@eaDir 等）/ macOS 资源分支
+        if is_ignored(Path(path)):
             continue
 
         try:
@@ -264,6 +285,8 @@ def load_sim_rows() -> List[Dict[str, Any]]:
             "crop_w": crop_map.get("crop_w"),
             "crop_h": crop_map.get("crop_h"),
             "is_meaningful": crop_map.get("is_meaningful"),
+            "used_at": used_at or "",                                       # 上次出图时间（ISO），空=从未
+            "used_count": int(used_count) if used_count is not None else 0,  # 累计出图次数
         }
         items.append(item)
 
@@ -357,16 +380,66 @@ def choose_photo_for_today(items: List[Dict[str, Any]], today: dt.date) -> Tuple
     }
     return global_best, info
 
-def choose_photos_for_today(items: List[Dict[str, Any]], today: dt.date, count: int = 5) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _is_recently_used(item: Dict[str, Any], now: dt.datetime, days: int) -> bool:
+    """该照片是否在最近 days 天内出过图（used_at 由渲染端写入，ISO 格式）。
+
+    解析不了就当作"没用过" —— 宽容处理：宁可偶尔重样，也不该因为一条脏数据
+    把照片永久排除在候选之外。
+    """
+    raw = (item.get("used_at") or "").strip()
+    if not raw:
+        return False
+    try:
+        t = dt.datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return False
+    if t.tzinfo is not None:
+        t = t.replace(tzinfo=None)
+    return (now - t) < dt.timedelta(days=days)
+
+
+def _pick_candidates(pool: List[Dict[str, Any]], exclude_paths, now: dt.datetime, recent_days: int):
+    """按"新鲜度"阶梯返回候选池，返回 (candidates, relaxed_level)。
+
+    阶梯（前面的够用就不降级）：
+      0 = 既不在 exclude_paths 里，最近 recent_days 天也没出过图
+      1 = 放宽"最近出过图"（但仍排除 exclude_paths）
+      2 = 连 exclude_paths 也放宽
+
+    第 2 级是必需的：相册总量可能比 count 还小（本机测试库 5 张 vs count=5），
+    此时硬排除会让"换一张"无图可选 —— 只能报错，或者推回同一张。
+    返回的池若不足 count，由调用方从当日其余照片补齐，那一步天然完成了
+    "放宽后再补足"，所以这里不需要做数量兜底。
+    """
+    excluded = exclude_paths or ()
+    no_excluded = [p for p in pool if str(p.get("path")) not in excluded]
+    fresh = [p for p in no_excluded if not _is_recently_used(p, now, recent_days)]
+    if fresh:
+        return fresh, 0
+    if no_excluded:
+        return no_excluded, 1
+    return list(pool), 2
+
+
+def choose_photos_for_today(items: List[Dict[str, Any]], today: dt.date, count: int = 5,
+                            exclude_paths=None, recent_days: int | None = None,
+                            now: dt.datetime | None = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     选片规则（多张版，按月日）：
     - 以 today 的月日为目标，例如 12 月 2 日 -> "12-02"
     - 在所有年份该月日的照片中，找 memory > MEMORY_THRESHOLD 的候选，尽量随机选 count 张
+    - 优先跳过"最近 recent_days 天出过图"的照片（软排除，候选用完会自动放宽）
+    - exclude_paths 里的照片优先跳过（"换一张"用它排掉刚展示过的一批）
     - 如果该月日没有任何 > 阈值的，则往前一天（月日）继续找（12-01, 11-30, ...），最多回溯 365 天
     - 如果整个 365 天都没有任何 > 阈值的照片，则在全局中选回忆度最高的若干张作为兜底
     """
     if not items:
         raise RuntimeError("没有任何可用照片")
+
+    if now is None:
+        now = dt.datetime.now()
+    if recent_days is None:
+        recent_days = RECENT_EXCLUDE_DAYS
 
     # 按 md 分组
     by_md: Dict[str, List[Dict[str, Any]]] = {}
@@ -395,19 +468,26 @@ def choose_photos_for_today(items: List[Dict[str, Any]], today: dt.date, count: 
         if not arr:
             continue
         # 候选：回忆度达标 且 非无意义（AI/阈值判定的 meaningful=0 不进每日一图）
-        candidates = [p for p in arr if p.get("memory", -1.0) > MEMORY_THRESHOLD and p.get("is_meaningful", 1) != 0]
-        if not candidates:
+        base = [p for p in arr if p.get("memory", -1.0) > MEMORY_THRESHOLD and p.get("is_meaningful", 1) != 0]
+        if not base:
             continue
+        # 再按新鲜度阶梯筛一层（不够会自动降级，见 _pick_candidates）
+        candidates, relax = _pick_candidates(base, exclude_paths, now, recent_days)
 
         # 随机选不重复的多张
         if len(candidates) >= count:
             chosen_list = random.sample(candidates, count)
         else:
-            # 候选不足 count 张，用该日剩余的高分照片补齐
+            # 候选不足 count 张，用该日剩余的高分照片补齐（这一步就是阶梯的"放宽"落实处）
             chosen_list = list(candidates)
+            # 按 path 去重，不要用 `extra in chosen_list` —— 那是对 dict 做值相等比较，
+            # 两张只在 used_at 等字段上不同的照片会被误判成同一张而漏加入。
+            seen = {str(c.get("path")) for c in chosen_list}
             for extra in arr:
-                if extra in chosen_list:
+                ep = str(extra.get("path"))
+                if ep in seen:
                     continue
+                seen.add(ep)
                 chosen_list.append(extra)
                 if len(chosen_list) >= count:
                     break
@@ -420,6 +500,8 @@ def choose_photos_for_today(items: List[Dict[str, Any]], today: dt.date, count: 
             "total_count_md": len(arr),
             "threshold": MEMORY_THRESHOLD,
             "fallback_global_max": False,
+            "freshness_relax": relax,       # 0=全新 / 1=放宽了近期已用 / 2=连排除集也放宽
+            "recent_days": recent_days,
         }
         return chosen_list, info
 
@@ -427,7 +509,8 @@ def choose_photos_for_today(items: List[Dict[str, Any]], today: dt.date, count: 
     meaningful_items = [x for x in items if x.get("is_meaningful", 1) != 0]
     if not meaningful_items:
         meaningful_items = items
-    sorted_all = sorted(meaningful_items, key=lambda x: x.get("memory", -1.0), reverse=True)
+    pool, relax = _pick_candidates(meaningful_items, exclude_paths, now, recent_days)
+    sorted_all = sorted(pool, key=lambda x: x.get("memory", -1.0), reverse=True)
     chosen_list = sorted_all[:count]
     info = {
         "target_md": target_md,
@@ -437,6 +520,8 @@ def choose_photos_for_today(items: List[Dict[str, Any]], today: dt.date, count: 
         "total_count_md": len(items),
         "threshold": MEMORY_THRESHOLD,
         "fallback_global_max": True,
+        "freshness_relax": relax,
+        "recent_days": recent_days,
     }
     return chosen_list, info
 # ========== 绘制 + 抖动 ==========
@@ -739,12 +824,126 @@ def write_h_array(bin_path: Path, h_path: Path, array_name: str = "daily_bin"):
 
 # ========== 主流程 ==========
 
-def main():
+def _load_rotation() -> List[str]:
+    """读取最近出过图的路径（新的在前）。文件缺失/损坏一律当作空。
+
+    排除集"宁少勿错"：读不出来最多是这次可能重选一张，而误判成"全都排除过"
+    会让换一张无图可选。
+    """
+    try:
+        data = json.loads(ROTATION_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [str(x) for x in data]
+    except Exception:
+        pass
+    return []
+
+
+def _append_rotation(paths: List[str]) -> None:
+    """把本轮出图的路径追加到轮转记录，只保留最近 ROTATION_KEEP 条。
+
+    原子写（tmp + os.replace）：server 可能同时在读它。
+    """
+    if not paths:
+        return
+    try:
+        merged = [str(p) for p in paths] + _load_rotation()
+        seen, uniq = set(), []
+        for p in merged:
+            if p in seen:
+                continue
+            seen.add(p)
+            uniq.append(p)
+        BIN_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = ROTATION_FILE.with_name(ROTATION_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(uniq[:ROTATION_KEEP], ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, ROTATION_FILE)
+    except Exception as e:
+        print(f"[WARN] 写轮转记录失败（不影响本次渲染）: {e}")
+
+
+def _mark_used(paths: List[str]) -> None:
+    """回写照片的出图时间与累计次数。
+
+    只 UPDATE 这两列，绝不能用 _save_result_to_db 那种整行 REPLACE —— 那会把
+    打分结果一并重写（还得逐个字段兜住）。计数用 COALESCE 累加而非直接赋值。
+    """
+    if not paths:
+        return
+    try:
+        from analyze_photos import open_db
+        conn = open_db(DB_PATH)
+    except Exception as e:
+        print(f"[WARN] 打开数据库失败，跳过回写出图记录: {e}")
+        return
+    try:
+        stamp = dt.datetime.now().isoformat(timespec="seconds")
+        conn.executemany(
+            "UPDATE photo_scores SET used_at = ?, "
+            "used_count = COALESCE(used_count, 0) + 1 WHERE path = ?",
+            [(stamp, str(p)) for p in paths],
+        )
+        conn.commit()
+        print(f"[OK] 已回写出图记录 {len(paths)} 张（used_at={stamp}）")
+    except Exception as e:
+        print(f"[WARN] 回写出图记录失败（不影响已生成的成品）: {e}")
+    finally:
+        conn.close()
+
+
+def _prune_screen_output(out_root: Path) -> None:
+    """清掉该屏上一轮遗留的渲染产物。
+
+    渲染不会自动删旧文件：上一轮 3 张横图、这一轮只有 2 张时，
+    landscape/photo_2.bin 会残留且不在新 manifest 里 —— 而设备是按序号
+    photo_<idx> 去拉的，会拉到一张不属于本批的照片。
+    某个方向本轮一张都没有时，其目录也必须一并清掉，否则里面的旧
+    latest.bin 会被顶层同步或"换一张"的排除集读到。
+    """
+    if not out_root.is_dir():
+        return
+    stale_patterns = ("photo_*.bin", "photo_*.h", "preview_*.png",
+                      "latest.bin", "latest.h", "preview.png", "manifest.json")
+    for d in sorted(out_root.iterdir()):
+        if not d.is_dir():
+            continue
+        removed = 0
+        for pat in stale_patterns:
+            for f in d.glob(pat):
+                try:
+                    f.unlink()
+                    removed += 1
+                except OSError as e:
+                    print(f"  [WARN] 无法删除旧产物 {f}: {e}")
+        if removed:
+            print(f"  [清理] {d.name}/ 删除 {removed} 个上一轮产物")
+        try:
+            d.rmdir()          # 只在已清空时成功；还有别的文件就保留
+        except OSError:
+            pass
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="每日选片并渲染墨水屏成品（照片 → 调色板抖动 → BIN + 预览 PNG）")
+    parser.add_argument("--next", action="store_true",
+                        help="换一张：优先排除最近已出过图的照片，重出一批并覆盖 latest.bin")
+    args = parser.parse_args(argv)
+
     items = load_sim_rows()
     if not items:
         raise SystemExit("没有可用照片（exif_json 为空或解析失败）。")
 
-    photos, info = choose_photos_for_today(items, TODAY, count=DAILY_PHOTO_QUANTITY)
+    # 「换一张」用轮转记录当排除集：它记的是最近出过图的 path，与屏数/方向无关，
+    # 比翻各屏各方向的 manifest 更可靠。日常 cron 不带 --next，用不到它 ——
+    # 日常只靠 used_at 的 30 天软排除。
+    exclude_paths = _load_rotation() if args.next else None
+    if args.next:
+        print(f"[INFO] 换一张模式：排除最近已出图的 {len(exclude_paths or [])} 张")
+
+    photos, info = choose_photos_for_today(items, TODAY, count=DAILY_PHOTO_QUANTITY,
+                                           exclude_paths=exclude_paths)
 
     print("[INFO] 目标月日:", info["target_md"])
     print("[INFO] 实际使用月日:", info["used_md"])
@@ -752,6 +951,10 @@ def main():
     print("[INFO] 候选数(>阈值):", info["candidate_count"])
     print("[INFO] 当日总数:", info["total_count_md"])
     print("[INFO] 使用兜底全局最大:", info["fallback_global_max"])
+    _relax = info.get("freshness_relax", 0)
+    print("[INFO] 新鲜度:", {0: "全部为近期未出过图的照片", 1: "候选不足，已放宽『近期出过图』",
+                             2: "候选不足，连排除集也一并放宽"}.get(_relax, _relax),
+          f"(近 {info.get('recent_days')} 天)")
 
     if not photos:
         raise SystemExit("选片结果为空。")
@@ -769,6 +972,8 @@ def main():
         sbfmt = str(screen.get("bin_format", "1byte_per_px"))
         out_root = BIN_OUTPUT_DIR / sname
         out_root.mkdir(parents=True, exist_ok=True)
+        # 先清上一轮产物，避免陈旧 photo_<idx>.bin 被设备按序号拉到
+        _prune_screen_output(out_root)
         print(f"\n[屏幕] {sname} ({sbfmt})")
 
         # 每方向一个计数器（该方向内的相对序号 photo_0..N 连续）
@@ -846,19 +1051,42 @@ def main():
             (d / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"  [OK] {orient} 已写 manifest.json (count={len(entries)}, canvas={cw}x{ch})")
 
-    # 兼容旧路径：默认屏 portrait 方向的产物复制到 BIN_OUTPUT_DIR 顶层（旧 ESP/模拟器用 latest.bin）
+    # 出图记录：跨所有屏只写一次（回写是按 path 的，与屏无关；按屏各写一次会把计数刷高）
+    chosen_paths = [str(p["path"]) for p in photos]
+    _mark_used(chosen_paths)
+    _append_rotation(chosen_paths)
+
+    # 兼容旧路径：默认屏的产物复制到 BIN_OUTPUT_DIR 顶层（旧固件/模拟器只认顶层 latest.bin）
+    # 必须按方向兜底：当天选中的照片可能全是横图或全是竖图，只找 portrait 会在
+    # 该方向不存在时静默跳过 → 顶层 latest.bin 一直是旧内容，相框永远显示昨天的图。
     default_name = str(DEFAULT_SCREEN.get("name", "default"))
-    default_dir = BIN_OUTPUT_DIR / default_name / "portrait"
     top_latest_bin = BIN_OUTPUT_DIR / "latest.bin"
     top_latest_h = BIN_OUTPUT_DIR / "latest.h"
     top_preview = BIN_OUTPUT_DIR / "preview.png"
-    if (default_dir / "latest.bin").exists():
-        shutil.copyfile(default_dir / "latest.bin", top_latest_bin)
-        print(f"[OK] 已同步默认屏 portrait latest.bin -> {top_latest_bin}")
-    if (default_dir / "latest.h").exists():
-        shutil.copyfile(default_dir / "latest.h", top_latest_h)
-    if (default_dir / "preview.png").exists():
-        shutil.copyfile(default_dir / "preview.png", top_preview)
+
+    src_dir = None
+    for orient in ("portrait", "landscape"):
+        cand = BIN_OUTPUT_DIR / default_name / orient
+        if (cand / "latest.bin").is_file():
+            src_dir = cand
+            break
+
+    if src_dir is None:
+        print(f"[WARN] 默认屏 {default_name} 没有任何方向的 latest.bin，顶层 latest.bin 未更新")
+    else:
+        for fname, dest in (("latest.bin", top_latest_bin),
+                            ("latest.h", top_latest_h),
+                            ("preview.png", top_preview)):
+            src = src_dir / fname
+            if src.is_file():
+                shutil.copyfile(src, dest)
+        print(f"[OK] 已同步默认屏 {default_name}/{src_dir.name} 产物 -> {BIN_OUTPUT_DIR} 顶层")
+
+    # 「换一张」的诚实验收：阶梯降到 2 说明候选全都落在排除集里，
+    # 这时选出来的还是那批 —— 用户点了等于没点，必须明确告诉他原因。
+    if args.next and info.get("freshness_relax") == 2:
+        print("[WARN] 今日可选照片都已推送过（候选全部落在排除集里），本次换不出新内容；"
+              "相册里这一天的照片太少了。")
 
 
 if __name__ == "__main__":

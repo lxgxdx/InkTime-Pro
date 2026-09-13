@@ -75,6 +75,11 @@ HOME_RADIUS_KM = 60.0
 # 最大接受距离（公里），超出则认为“不在任何城市附近”
 CITY_MAX_DISTANCE_KM = 100.0
 
+# 最近城市超过该距离时，地名后带上公里数（如 "深圳 32km"），提示这只是"最近的城市"。
+# 城市库（world_cities_zh.csv）由 geonames cities500 生成：全球 23 万条、中国 1.6 万条，
+# 多数照片能落在阈值内，显示的就是干净的城市名。
+CITY_DIST_HINT_KM = 20.0
+
 # 墨水屏渲染 BIN 文件输出目录
 # Docker 部署时可覆盖：INKTIME_BIN_OUTPUT_DIR
 BIN_OUTPUT_DIR = os.environ.get("INKTIME_BIN_OUTPUT_DIR", "./output")
@@ -98,6 +103,18 @@ VLM_MAX_LONG_EDGE = int(os.environ.get("INKTIME_VLM_MAX_LONG_EDGE", 1024))
 
 # 无意义照片判定：memory_score 低于该值则视为"无意义"，跳过旁白与成品生成
 UNMEANINGFUL_THRESHOLD = float(os.environ.get("INKTIME_UNMEANINGFUL_THRESHOLD", 40.0))
+
+# ========== 照片去重 ==========
+# 独立任务：analyze_photos.py --dedupe-only（建议单独 cron，别和扫描挤在一起 ——
+# 首次全量建索引要读遍 NAS 上每个文件，可能几十分钟）
+# 判重分四层，按成本递增：文件大小 → 内容 sha1 → 连拍(EXIF 时间) → 感知哈希(dHash)
+DEDUPE_ENABLED = True             # 扫描时跳过已判定为重复的照片（省 VLM 额度）
+DEDUPE_SIMILAR_ENABLED = True     # 用 dHash 确认视觉相似；关掉则退化为纯时间判重（会误杀连拍）
+DEDUPE_HAMMING_MAX = 6            # dHash 汉明距离阈值 0~64，越大越宽松（8 以上容易误判）
+DEDUPE_BURST_ENABLED = True       # 连拍聚类（只用来缩小候选范围，是否重复仍由 dHash 定夺）
+DEDUPE_BURST_GAP_SEC = 3          # 相邻两张拍摄时间间隔 ≤ N 秒视为同一次连拍
+# 选片时优先跳过"最近 N 天已出过图"的照片，避免连着几天推同一批
+RECENT_EXCLUDE_DAYS = 30
 
 # ========== 5小时窗口对齐的 Token 感知调度参数（可选）==========
 # MiniMax 套餐额度是"5 小时一清、用不完浪费"。每个窗口末期/空闲时段自动多扫照片、把额度烧到剩底线。

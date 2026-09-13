@@ -79,31 +79,33 @@ def normalize_crop(crop: Optional[dict]) -> dict:
 
 
 def render_orientation(img: Image.Image) -> str:
-    """按解码后图片的显示方向返回 "landscape" / "portrait" / "square"。
+    """按解码后图片的显示方向返回 "landscape" / "portrait"。
 
-    用 img.size（经 load_image_any 的 exif_transpose，已是人眼看的方向）判断：
-    宽>高=风景(landscape)、高>宽=人像(portrait)、相等=square。
+    只有两种取值，这是刻意的：这个字符串会直接当目录名用，而下载路由的
+    方向白名单、顶层 latest.bin 同步、成品缓存路径都只认这两种。曾经返回
+    过第三种 "square"（正方形图），结果是它渲染进 output/<屏>/square/ 后，
+    设备按白名单永远 404，顶层 latest.bin 同步也写死找 portrait 而静默跳过
+    → 相框一直显示昨天的图。正方形一律归入 portrait：屏幕本身就是竖用，
+    1:1 图放进竖框更自然。
+
+    用 img.size（经 load_image_any 的 exif_transpose，已是人眼看的方向）判断。
     """
     w, h = img.size
-    if w > h:
-        return "landscape"
-    if h > w:
-        return "portrait"
-    return "square"
+    return "landscape" if w > h else "portrait"
 
 
 def orientation_dims(screen: dict, orient: Optional[str]) -> tuple:
     """返回某方向下的画布尺寸 (canvas_w, canvas_h)。
 
     屏幕配置记的是默认方向（竖用）。landscape(风景横图) 时对调宽高（横用），
-    portrait/square 保持默认。orient 为空时按默认（portrait）。
+    portrait 保持默认。orient 为空时按默认（portrait）。
     """
     screen = dict(screen or {})
     w = int(screen.get("width", 480))
     h = int(screen.get("height", 800))
     if orient == "landscape":
         return (h, w)          # 对调：横用
-    return (w, h)              # portrait / square / 缺省：默认竖用
+    return (w, h)              # portrait / 缺省：默认竖用
 
 
 def photo_fingerprint(path, screen) -> str:

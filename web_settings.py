@@ -58,6 +58,9 @@ def _default() -> dict:
             "analyze_enabled": True,
             "render_cron": "5 4 * * *",
             "render_enabled": True,
+            # 去重索引：独立任务（不烧 VLM 额度，首次全量较慢，之后是增量）
+            "dedupe_cron": "0 2 * * *",
+            "dedupe_enabled": True,
         },
         "screens": [
             {
@@ -100,6 +103,13 @@ def _default() -> dict:
             "VLM_MAX_LONG_EDGE": 1024,
             "HOME_MIN_SCORE": 60.0,
             "HOME_HIDE_UNMEANINGFUL": True,
+            # 去重（独立任务 --dedupe-only 产出索引，扫描时据此跳过重复照片）
+            "DEDUPE_ENABLED": True,
+            "DEDUPE_SIMILAR_ENABLED": True,
+            "DEDUPE_HAMMING_MAX": 6,
+            "DEDUPE_BURST_ENABLED": True,
+            "DEDUPE_BURST_GAP_SEC": 3,
+            "RECENT_EXCLUDE_DAYS": 30,
         },
         "quota": {
             "idle_start": "23:00",

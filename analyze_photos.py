@@ -3,6 +3,8 @@
 
 from pathlib import Path
 import base64
+import datetime as dt
+import hashlib
 import json
 import sqlite3
 import os
@@ -270,6 +272,18 @@ if not WORLD_CITIES_CSV.is_absolute():
 
 CITY_GRID_DEG = float(getattr(cfg, "CITY_GRID_DEG", 1.0) or 1.0)
 CITY_MAX_DISTANCE_KM = float(getattr(cfg, "CITY_MAX_DISTANCE_KM", 80.0) or 80.0)
+# 最近城市距离超过该值时，地名后面带上公里数（如 "深圳 32km"）—— 提示这只是
+# "最近的城市"而不是拍摄地本身，一眼能看出这个地名的可信度。
+# 城市库够密时绝大多数照片都在阈值内，显示的就是干净的城市名。
+CITY_DIST_HINT_KM = float(getattr(cfg, "CITY_DIST_HINT_KM", 20.0) or 20.0)
+# 在「最近城市 + 该缓冲」范围内优先选人口最多的点。cities500 会把一座城市拆成很多
+# 区/町级点，纯按距离取最近会拿到认不出的名字（东京市中心最近的点叫「永福」，
+# 而「东京」本体在 4km 外）。缓冲要够大才能把它们纳入比较；10km 在城市尺度上
+# 通常仍属同一座城市，不会跨到隔壁市。
+CITY_NEAR_BUFFER_KM = float(getattr(cfg, "CITY_NEAR_BUFFER_KM", 10.0) or 10.0)
+
+
+
 HOME_LAT = float(getattr(cfg, "HOME_LAT", 22.543096) or 22.543096)
 HOME_LON = float(getattr(cfg, "HOME_LON", 114.057865) or 114.057865)
 HOME_RADIUS_KM = float(getattr(cfg, "HOME_RADIUS_KM", 60.0) or 60.0)
@@ -345,6 +359,7 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             height            INTEGER,
             orientation       TEXT,
             used_at           TEXT,
+            used_count        INTEGER,
             exif_json         TEXT,
             raw_json          TEXT,
             exif_datetime     TEXT,
@@ -380,6 +395,10 @@ def ensure_table(conn: sqlite3.Connection) -> None:
         pass
     try:
         cur.execute("ALTER TABLE photo_scores ADD COLUMN used_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cur.execute("ALTER TABLE photo_scores ADD COLUMN used_count INTEGER")
     except sqlite3.OperationalError:
         pass
     try:
@@ -554,7 +573,7 @@ def list_images(limit: int | None = None) -> list[Path]:
         if scanned % 500 == 0:
             print(f"[SCAN] 已扫描文件数：{scanned} …")
         if p.is_file() and p.suffix.lower() in exts:
-            if is_screenshot(p):
+            if is_ignored(p):
                 continue
             files.append(p)
     print(f"[INFO] 扫描完成，共发现 {len(files)} 张图片（文件总数 {scanned}）。")
@@ -562,24 +581,482 @@ def list_images(limit: int | None = None) -> list[Path]:
         files = files[:limit]
     return files
 
-# 排除 Screenshot 图片
-def is_screenshot(path: Path) -> bool:
-    s = str(path)
-    return "screenshot" in s.lower()
+
+# NAS / 系统目录名（小写比较）：这些目录里放的是缩略图或索引文件，不是用户照片。
+# 群晖 @eaDir、威联通 .@__thumb、Synology Photo 的 @Recycle、回收站等。
+# 若不过滤，群晖缩略图会以正常照片身份送去 VLM 打分，白烧 token。
+_IGNORED_DIR_PARTS = {
+    "@eadir", ".@__thumb", ".thumbnails", "#recycle", ".#recycle",
+    "@recycle", ".trash", ".trashes", ".snapshot", "synophotothumb",
+    ".photostation", ".appledouble", "@tmp", "recycler", "$recycle.bin",
+}
+
+
+def is_ignored(path: Path) -> bool:
+    """排除截图、NAS 缩略图目录、系统资源分支文件。
+
+    目录按【路径组件】整段比较，而非整串子串匹配 —— 否则用户目录名里带
+    "photo"、"thumb" 之类的字样会连累其下全部照片。截图沿用原有的子串匹配
+    （要能命中 Screenshot_20230101.jpg 这种文件名）。
+    """
+    if "screenshot" in str(path).lower():
+        return True
+    if any(part.lower() in _IGNORED_DIR_PARTS for part in path.parts):
+        return True
+    # macOS 的 ._xxx 资源分支（与真照片同名但带前缀，会被当独立照片重复入库）
+    if path.name.startswith("._"):
+        return True
+    return False
+
+
+# 旧名保留：外部/历史调用点少，但避免遗漏。
+is_screenshot = is_ignored
 
 
 def filter_unscored(conn: sqlite3.Connection, paths: list[Path]) -> list[Path]:
+    """返回 paths 中尚未入库的那些（保持入参顺序）。
+
+    用 TEMP 表 JOIN 而非 IN (?,?,…)：8000 张时占位符数量会撞上 SQLite 的变量
+    上限（老版本为 999），且超长 SQL 的解析本身就慢。与 main() 里清理残留记录
+    的临时表是同一个套路（表名不同，互不影响）。
+    """
     if not paths:
         return []
 
     cur = conn.cursor()
-    placeholders = ",".join("?" for _ in paths)
+    cur.execute("CREATE TEMP TABLE IF NOT EXISTS _temp_quoted_paths (path TEXT PRIMARY KEY)")
+    cur.execute("DELETE FROM _temp_quoted_paths")
+    cur.executemany(
+        "INSERT OR IGNORE INTO _temp_quoted_paths (path) VALUES (?)",
+        [(str(p),) for p in paths],
+    )
     rows = cur.execute(
-        f"SELECT path FROM photo_scores WHERE path IN ({placeholders})",
-        [str(p) for p in paths],
+        "SELECT t.path FROM _temp_quoted_paths t "
+        "JOIN photo_scores s ON s.path = t.path"
     ).fetchall()
     already = {row[0] for row in rows}
+    cur.execute("DELETE FROM _temp_quoted_paths")
     return [p for p in paths if str(p) not in already]
+
+
+# =======================
+# 照片去重索引（独立的 photo_hashes 表）
+# =======================
+# 为什么不塞进 photo_scores：
+#   1. photo_scores 的写入走 INSERT OR REPLACE，它不认识的列在重扫时会被抹掉；
+#   2. 哈希是"派生数据"，生命周期和打分结果不同（可整表重算、可中断续跑）；
+#   3. 还没入库的新照片也要能参与判重，photo_scores 装不下它们。
+
+def ensure_hash_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS photo_hashes (
+            path        TEXT PRIMARY KEY,
+            file_size   INTEGER,
+            file_sha1   TEXT,
+            dhash       TEXT,
+            exif_dt     TEXT,
+            exif_make   TEXT,
+            exif_model  TEXT,
+            dup_of      TEXT,
+            dup_kind    TEXT,
+            indexed_at  TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def _file_size(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _sha1_file(path: Path) -> str | None:
+    """文件内容的 sha1（分块读，大 RAW 不会一次性进内存）。"""
+    h = hashlib.sha1()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+    except OSError as e:
+        print(f"[WARN] 读取失败，跳过内容哈希 {path}: {e}")
+        return None
+    return h.hexdigest()
+
+
+def _load_raw_thumbnail(path: Path):
+    """RAW 的内嵌缩略图（快）；没有缩略图才退化为半尺寸解码。
+
+    全尺寸 postprocess 一张 DNG 要好几秒，8000 张就是几小时；而 dHash 只需要
+    9x8 灰度，内嵌缩略图完全够用。
+    """
+    import rawpy
+    try:
+        with rawpy.imread(str(path)) as raw:
+            try:
+                thumb = raw.extract_thumb()
+                if thumb.format == rawpy.ThumbFormat.JPEG:
+                    return Image.open(io.BytesIO(thumb.data)).convert("L")
+                return Image.fromarray(thumb.data).convert("L")
+            except Exception:
+                pass                      # 无内嵌缩略图（线性 DNG 等常见）
+            rgb = raw.postprocess(use_camera_wb=True, half_size=True)
+        return Image.fromarray(rgb).convert("L")
+    except Exception as e:
+        print(f"[WARN] RAW 解码失败，跳过感知哈希 {path}: {e}")
+        return None
+
+
+def _dhash(path: Path, size: int = 8) -> str | None:
+    """感知哈希 dHash，返回 16 位十六进制（64 bit）。
+
+    做法：缩到 (size+1) x size 灰度，逐行比较相邻像素亮暗 → 每行 size 个 bit。
+    对 JPEG 用 draft() 走 libjpeg 的 DCT 缩略（毫秒级）；HEIC 不支持 draft，
+    只能直接 resize。
+    """
+    img = None
+    try:
+        if path.suffix.lower() in _RAW_EXTS:
+            img = _load_raw_thumbnail(path)
+            if img is None:
+                return None
+            img = img.resize((size + 1, size), Image.LANCZOS)
+        else:
+            with Image.open(path) as im:
+                try:
+                    im.draft("L", (size + 1, size))   # JPEG：DCT 缩略，不解全图
+                except Exception:
+                    pass
+                img = im.convert("L").resize((size + 1, size), Image.LANCZOS)
+
+        pixels = list(img.getdata())
+        width = size + 1
+        bits = 0
+        for row in range(size):
+            base = row * width
+            for col in range(size):
+                bits = (bits << 1) | (1 if pixels[base + col] > pixels[base + col + 1] else 0)
+        return f"{bits:016x}"
+    except Exception as e:
+        print(f"[WARN] 感知哈希失败，跳过 {path}: {e}")
+        return None
+    finally:
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
+
+
+def hamming_hex(a: str, b: str) -> int:
+    """两个 16 位十六进制 dHash 的汉明距离（0~64）。"""
+    try:
+        return (int(a, 16) ^ int(b, 16)).bit_count()
+    except (TypeError, ValueError):
+        return 64
+
+
+_EXIF_DT_FORMATS = ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y:%m:%d %H:%M")
+
+
+def _parse_exif_dt(value) -> dt.datetime | None:
+    """解析 EXIF 拍摄时间。
+
+    EXIF 标准写法是 "2023:10:05 14:23:11"（日期用冒号分隔），
+    datetime.fromisoformat 解析不了，必须显式给格式串。
+    """
+    if not value:
+        return None
+    txt = str(value).strip()
+    for fmt in _EXIF_DT_FORMATS:
+        try:
+            return dt.datetime.strptime(txt, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _read_exif_light(path: Path) -> tuple:
+    """轻量读 EXIF：(拍摄时间, 相机厂商, 机型)，不解码像素。
+
+    JPEG/HEIC 走 PIL 的 header 读取（最快）；RAW 用 PIL 打不开，退回 exiftool。
+    RAW 恰恰是相机用户重复照片的大头（连拍、RAW+JPEG 同拍），不补这条路径，
+    连拍与相似判重对它们就完全失效。
+    """
+    try:
+        info = read_exif(path)
+    except Exception:
+        info = {}
+    if not isinstance(info, dict):
+        info = {}
+    if info.get("datetime"):
+        return (_parse_exif_dt(info.get("datetime")),
+                (info.get("make") or "").strip() or None,
+                (info.get("model") or "").strip() or None)
+    # PIL 没拿到日期（RAW，或该文件的 EXIF 缺日期）→ 交给 exiftool 再试一次
+    ex = read_exif_with_exiftool(path)
+    return (_parse_exif_dt(ex.get("datetime")),
+            (ex.get("make") or "").strip() or None,
+            (ex.get("model") or "").strip() or None)
+
+
+def run_dedupe(conn: sqlite3.Connection, paths: list, *,
+               enable_similar: bool = True, hamming_max: int = 6,
+               enable_burst: bool = True, burst_gap: int = 3,
+               reindex: bool = False, progress_cb=None) -> dict:
+    """建立/更新去重索引，并标记重复项，返回统计。
+
+    分层，按成本从低到高，贵的那层只在嫌疑集上跑：
+      ① file_size 分桶  —— stat 就有；size 不同的文件不可能字节相同
+      ② sha1           —— 只在同 size 组内算            → dup_kind="exact"
+      ③ 连拍聚类        —— (机型, 拍摄时间) 邻近，纯 EXIF  → dup_kind="burst"
+      ④ dHash          —— 只对同机型同拍摄日的照片算      → dup_kind="similar"
+
+    留一手不吃亏的顺序：④ 限定在"同机型同一天"的组内做，把 8000x8000 的两两
+    比较降到每组几张小表，同时也不必为全库算感知哈希（那要开 8000 个文件）。
+
+    保留规则（确定性）：已打过分的胜出，否则路径字典序最小者胜。确定性很关键 ——
+    否则每轮跑出来的 dup_of 会翻转，用户会觉得"重复对象"变来变去。
+    """
+    ensure_hash_table(conn)
+    cur = conn.cursor()
+    now_iso = dt.datetime.now().isoformat(timespec="seconds")
+
+    # ---- 载入既有索引 ----
+    known = {}
+    for r in cur.execute("SELECT path, file_size, file_sha1, dhash, exif_dt, "
+                         "exif_make, exif_model FROM photo_hashes"):
+        known[r[0]] = {"size": r[1], "sha1": r[2], "dhash": r[3],
+                       "dt": _parse_exif_dt(r[4]), "_dt_raw": r[4],
+                       "make": r[5], "model": r[6]}
+
+    # ---- 一次 stat 拿全部文件大小（远比逐个 Image.open 便宜）----
+    info = {}
+    todo = 0
+    for p in paths:
+        sp = str(p)
+        sz = _file_size(p)
+        old = known.get(sp)
+        if old and not reindex and old["size"] == sz and sz is not None:
+            info[sp] = dict(old)
+            continue
+        todo += 1
+        ex_dt, ex_make, ex_model = _read_exif_light(p)
+        info[sp] = {"size": sz, "sha1": None, "dhash": None, "dt": ex_dt,
+                    "_dt_raw": ex_dt.isoformat() if ex_dt else None,
+                    "make": ex_make, "model": ex_model}
+        if progress_cb and todo % 200 == 0:
+            progress_cb(todo, len(paths), "读取 EXIF")
+
+    # ---- union-find（代表取字典序最小，保证结果稳定）----
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if rb < ra:
+            ra, rb = rb, ra
+        parent[rb] = ra
+
+    kinds: dict[str, str] = {}          # 记录"被判重的原因"，取首次判定
+    stats = {"exact": 0, "burst": 0, "similar": 0}
+
+    # ---- ① size 分桶 + ② 同 size 内算 sha1 ----
+    by_size: dict[int, list] = {}
+    for sp, meta in info.items():
+        if meta["size"] is not None:
+            by_size.setdefault(meta["size"], []).append(sp)
+
+    for size, group in by_size.items():
+        if len(group) < 2:
+            continue
+        for sp in group:
+            if info[sp]["sha1"] is None:
+                info[sp]["sha1"] = _sha1_file(Path(sp))
+        by_sha: dict[str, list] = {}
+        for sp in group:
+            if info[sp]["sha1"]:
+                by_sha.setdefault(info[sp]["sha1"], []).append(sp)
+        for sha, same in by_sha.items():
+            if len(same) < 2:
+                continue
+            same.sort()
+            for sp in same[1:]:
+                union(same[0], sp)
+                kinds.setdefault(sp, "exact")
+                stats["exact"] += 1
+
+    # ---- ③ 划定"时间邻近"候选簇（这一步不判重，只决定谁值得比感知哈希）----
+    # 光按时间判重会误杀：扫街时连拍十张构图各不相同，时间都在几秒内，一刀切会把
+    # 其中九张当重复丢掉 —— 那是真的丢内容。所以时间只用来【缩小候选范围】，
+    # 是否真的重复一律交给 ④ 的 dHash 确认。
+    burst_clusters: list[list] = []
+    if enable_burst:
+        by_cam: dict[tuple, list] = {}
+        for sp, meta in info.items():
+            if meta["dt"] is None or not meta["model"]:
+                continue
+            by_cam.setdefault((meta["make"] or "", meta["model"]), []).append(sp)
+        for _, group in by_cam.items():
+            group.sort(key=lambda s: (info[s]["dt"], s))
+            window: list = []
+            for sp in group:
+                if window and (info[sp]["dt"] - info[window[-1]]["dt"]).total_seconds() > burst_gap:
+                    if len(window) >= 2:
+                        burst_clusters.append(window)
+                    window = []
+                window.append(sp)
+            if len(window) >= 2:
+                burst_clusters.append(window)
+
+    # ---- ④ dHash 确认：候选集 = 时间邻近簇 ∪ 同机型同拍摄日 ----
+    suspect_sets: list[tuple[list, str]] = []
+    if enable_burst:
+        suspect_sets += [(c, "burst") for c in burst_clusters]
+    if enable_similar:
+        by_day: dict[tuple, list] = {}
+        for sp, meta in info.items():
+            if meta["dt"] is None:
+                continue
+            key = (meta["make"] or "", meta["model"] or "", meta["dt"].date().isoformat())
+            by_day.setdefault(key, []).append(sp)
+        for group in by_day.values():
+            if len(group) >= 2:
+                suspect_sets.append((group, "similar"))
+
+    for group, kind in suspect_sets:
+        if not enable_similar:
+            # 关掉视觉校验时退化为纯时间判重：快，但会丢掉连拍里构图不同的那些
+            head = group[0]
+            for sp in group[1:]:
+                if find(head) != find(sp):
+                    union(head, sp)
+                    kinds.setdefault(sp, kind)
+                    stats[kind] += 1
+            continue
+        for sp in group:
+            if info[sp]["dhash"] is None:
+                info[sp]["dhash"] = _dhash(Path(sp))
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                a, b = group[i], group[j]
+                da, db_ = info[a]["dhash"], info[b]["dhash"]
+                if not da or not db_:
+                    continue
+                if hamming_hex(da, db_) <= hamming_max and find(a) != find(b):
+                    union(a, b)
+                    kinds.setdefault(b, kind)
+                    stats[kind] += 1
+
+    # ---- 汇总：每组选一个保留者 ----
+    groups: dict[str, list] = {}
+    for sp in info:
+        groups.setdefault(find(sp), []).append(sp)
+
+    scored = {r[0] for r in cur.execute(
+        "SELECT path FROM photo_scores WHERE memory_score IS NOT NULL")}
+
+    rows, dup_total = [], 0
+    for root, members in groups.items():
+        members.sort()
+        scored_members = [m for m in members if m in scored]
+        keep = (min(scored_members) if scored_members else members[0]) if members else None
+        for sp in members:
+            meta = info[sp]
+            is_dup = sp != keep
+            if is_dup:
+                dup_total += 1
+            rows.append((
+                sp, meta["size"], meta["sha1"], meta["dhash"],
+                meta.get("_dt_raw"), meta["make"], meta["model"],
+                keep if is_dup else None,
+                kinds.get(sp) if is_dup else None,
+                now_iso,
+            ))
+
+    cur.executemany(
+        """INSERT OR REPLACE INTO photo_hashes
+           (path, file_size, file_sha1, dhash, exif_dt, exif_make, exif_model,
+            dup_of, dup_kind, indexed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    conn.commit()
+
+    stats.update({"indexed": len(rows), "newly_indexed": todo, "duplicates": dup_total})
+    return stats
+
+
+def orphan_recheck(conn: sqlite3.Connection) -> int:
+    """释放"保留者已经不存在/已失效"的重复标记。
+
+    没有这一步会有个死结：原图被删（或重扫后变成无意义）之后，指向它的
+    重复照片永远带着 dup_of，扫描一直跳过它，于是永久沉底、再也无法触及。
+    每轮扫描开头跑一次，开销只是一条 GROUP BY。
+    """
+    cur = conn.cursor()
+    try:
+        dup_rows = cur.execute(
+            "SELECT path, dup_of FROM photo_hashes WHERE dup_of IS NOT NULL").fetchall()
+    except sqlite3.OperationalError:
+        return 0          # 表还没建（从未跑过去重），没什么可释放的
+    alive = {r[0]: (r[1], r[2]) for r in cur.execute(
+        "SELECT path, memory_score, is_meaningful FROM photo_scores")}
+    freed = 0
+    for path, dup_of in dup_rows:
+        parent = alive.get(dup_of)
+        # 保留者没了，或它自己就是无意义/没打分的 → 这个"重复"没有意义了
+        if parent is None or parent[0] is None or parent[1] == 0:
+            cur.execute(
+                "UPDATE photo_hashes SET dup_of = NULL, dup_kind = NULL WHERE path = ?",
+                (path,))
+            freed += 1
+    if freed:
+        conn.commit()
+    return freed
+
+
+def load_dup_map(conn: sqlite3.Connection) -> dict:
+    """返回 {path: (dup_of, dup_kind)}，供扫描时跳过已判重的照片。"""
+    try:
+        return {r[0]: (r[1], r[2]) for r in conn.execute(
+            "SELECT path, dup_of, dup_kind FROM photo_hashes WHERE dup_of IS NOT NULL")}
+    except sqlite3.OperationalError:
+        return {}          # 表还没建（从未跑过去重）
+
+
+def open_db(db_path: Path | str | None = None) -> sqlite3.Connection:
+    """统一的 photos.db 连接（含 WAL 与锁等待）。
+
+    db_path 省略时用本模块的 DB_PATH；调用方有自己的库路径时应显式传入，
+    否则会静默连到错误的库（render_daily_photo 就属于这种情况）。
+
+    WAL + busy_timeout 是必需的：从 v6 起 render_daily_photo.py 也会写库，
+    photos.db 从此有两个并发写入进程，默认 5 秒的锁等待会在长扫描中途抛
+    "database is locked"。WAL 让读不阻塞写；synchronous=NORMAL 是 WAL 下的
+    推荐搭配（崩溃最多丢最后一个事务，不会损坏库文件）。
+    """
+    target = DB_PATH if db_path is None else db_path
+    conn = sqlite3.connect(target, check_same_thread=False, timeout=30.0)
+    for pragma in ("PRAGMA journal_mode=WAL",
+                   "PRAGMA busy_timeout=30000",
+                   "PRAGMA synchronous=NORMAL"):
+        try:
+            conn.execute(pragma)
+        except sqlite3.DatabaseError:
+            pass
+    return conn
 
 
 def _convert_gps_to_deg(value):
@@ -620,6 +1097,30 @@ def read_gps_with_exiftool(path: Path):
         "lat": float(lat),
         "lon": float(lon),
         "alt": float(alt) if alt is not None else None,
+    }
+
+
+def read_exif_with_exiftool(path: Path) -> dict:
+    """用 exiftool 读拍摄时间与机型（PIL 打不开 RAW 时的兜底）。
+
+    RAW 是相机用户重复照片的大头（连拍、RAW+JPEG 同拍），而 read_exif 靠
+    Image.open，对 DNG/CR2 这些直接返回空 —— 不补这条路，连拍与相似判重
+    对 RAW 就完全失效。一次调用带全所需 tag，避免每张起多个子进程。
+    """
+    if not EXIFTOOL_AVAILABLE:
+        return {}
+    try:
+        result = subprocess.run(
+            ["exiftool", "-json", "-DateTimeOriginal", "-Make", "-Model", str(path)],
+            capture_output=True, text=True, check=True,
+        )
+        data = json.loads(result.stdout)[0]
+    except Exception:
+        return {}
+    return {
+        "datetime": data.get("DateTimeOriginal"),
+        "make": (data.get("Make") or "").strip() or None,
+        "model": (data.get("Model") or "").strip() or None,
     }
 
 
@@ -777,7 +1278,8 @@ import csv
 import math
 from typing import Dict, List, Tuple, Optional
 
-CityRecord = Tuple[float, float, str, str]  # (lat, lon, name_zh, name_en)
+# (lat, lon, name_zh, name_en, population, is_city)
+CityRecord = Tuple[float, float, str, str, int, int]
 
 _CITY_CACHE_CITIES: List[CityRecord] | None = None
 _CITY_CACHE_GRID: Dict[Tuple[int, int], List[int]] | None = None
@@ -817,9 +1319,17 @@ def load_world_cities(csv_path: Path) -> Tuple[List[CityRecord], Dict[Tuple[int,
                 continue
             name_en = (row.get("name_en") or "").strip()
             name_zh = (row.get("name_zh") or "").strip()
-            cities.append((lat, lon, name_zh, name_en))
+            try:
+                pop = int((row.get("population") or "0").strip() or 0)
+            except ValueError:
+                pop = 0
+            try:
+                is_city = int((row.get("is_city") or "0").strip() or 0)
+            except ValueError:
+                is_city = 0
+            cities.append((lat, lon, name_zh, name_en, pop, is_city))
 
-    for idx, (lat, lon, name_zh, name_en) in enumerate(cities):
+    for idx, (lat, lon, name_zh, name_en, _pop, _is_city) in enumerate(cities):
         key = grid_key(lat, lon)
         grid_index.setdefault(key, []).append(idx)
 
@@ -832,9 +1342,10 @@ def find_nearest_city(
     cities: List[CityRecord],
     grid_index: Dict[Tuple[int, int], List[int]],
     max_km: float = 80.0,
-) -> str:
+) -> Tuple[str, Optional[float]]:
+    """返回 (城市名, 距离公里数)；附近没有城市时返回 ("", None)。"""
     if not cities:
-        return ""
+        return ("", None)
 
     gx, gy = grid_key(lat, lon)
 
@@ -851,23 +1362,36 @@ def find_nearest_city(
     if not candidates:
         candidates = collect_candidates(radius=2)
     if not candidates:
-        return ""
+        return ("", None)
 
-    best_idx: Optional[int] = None
+    dists: Dict[int, float] = {}
     best_dist = float("inf")
-
     for idx in candidates:
-        city_lat, city_lon, name_zh, name_en = cities[idx]
+        city_lat, city_lon = cities[idx][0], cities[idx][1]
         d = haversine_km(lat, lon, city_lat, city_lon)
+        dists[idx] = d
         if d < best_dist:
             best_dist = d
-            best_idx = idx
 
-    if best_idx is None or best_dist > max_km:
-        return ""
+    if best_dist > max_km:
+        return ("", None)
 
-    _, _, name_zh, name_en = cities[best_idx]
-    return name_zh or name_en or ""
+    nearest_idx = min(dists, key=lambda i: dists[i])
+    if cities[nearest_idx][5] == 1:
+        # 最近的点本身就是座正经城市（首都/省会/地级市，见 geonames feature code）
+        # → 直接用。这里不能只看人口：上海的黄浦区有 30 万人，会把「上海」顶掉；
+        # 而澳门作为特别行政区必须用它自己，不能被 8km 外的珠海盖过去。
+        best_idx = nearest_idx
+    else:
+        # 最近的点只是街区/街道办/村镇（cities500 把一座城市拆成大量区/町级点，
+        # 东京市中心最近的点叫「永福」、巴黎市中心是「Paris 04 Hôtel-de-Ville」），
+        # 这时在「最近距离 + 缓冲」范围内挑人口最大的那个，人口并列时优先有中文名。
+        near = [i for i, d in dists.items()
+                if d <= min(best_dist + CITY_NEAR_BUFFER_KM, max_km)]
+        best_idx = max(near, key=lambda i: (cities[i][4], 1 if cities[i][2] else 0, -dists[i]))
+
+    name_zh, name_en = cities[best_idx][2], cities[best_idx][3]
+    return (name_zh or name_en or "", dists[best_idx])
 
 def get_city_resolver():
     global _CITY_CACHE_CITIES, _CITY_CACHE_GRID
@@ -877,7 +1401,13 @@ def get_city_resolver():
     def resolve(lat: float | None, lon: float | None) -> str:
         if lat is None or lon is None:
             return ""
-        return find_nearest_city(lat, lon, _CITY_CACHE_CITIES, _CITY_CACHE_GRID, max_km=CITY_MAX_DISTANCE_KM)
+        name, km = find_nearest_city(lat, lon, _CITY_CACHE_CITIES, _CITY_CACHE_GRID,
+                                     max_km=CITY_MAX_DISTANCE_KM)
+        if not name:
+            return ""
+        if km is not None and km >= CITY_DIST_HINT_KM:
+            return f"{name} {km:.0f}km"
+        return name
 
     return resolve
 
@@ -1309,12 +1839,19 @@ def _process_one_photo(path: Path, city_resolver) -> dict | None:
 
 
 def _save_result_to_db(cur, conn, rec: dict):
-    """将一条处理结果写入数据库。"""
+    """将一条处理结果写入数据库。
+
+    ⚠️ INSERT OR REPLACE 在 path 这种主键表上等于【先 DELETE 再 INSERT】，整行
+    由列清单重建 —— 所以任何"不由本次打分产生"的列（used_at / used_count，
+    它们是渲染端写的出图记录）都必须用 COALESCE 子查询把旧值捞回来，否则
+    用户点一次「重新扫描」，出图历史就被清空，选片会立刻重推同一批照片。
+    今后再往这张表加这类列，记得同样处理。
+    """
     cur.execute(
         """
         INSERT OR REPLACE INTO photo_scores
         (path, caption, type, memory_score, beauty_score, reason,
-         width, height, orientation, used_at,
+         width, height, orientation, used_at, used_count,
          exif_json, raw_json,
          exif_datetime, exif_make, exif_model,
          exif_iso, exif_exposure_time, exif_f_number, exif_focal_length,
@@ -1322,6 +1859,7 @@ def _save_result_to_db(cur, conn, rec: dict):
          crop_x, crop_y, crop_w, crop_h, is_meaningful)
         VALUES (?, ?, ?, ?, ?, ?,
                 ?, ?, ?, COALESCE((SELECT used_at FROM photo_scores WHERE path = ?), NULL),
+                COALESCE((SELECT used_count FROM photo_scores WHERE path = ?), NULL),
                 ?, ?,
                 ?, ?, ?,
                 ?, ?, ?, ?,
@@ -1338,7 +1876,8 @@ def _save_result_to_db(cur, conn, rec: dict):
             rec["width"],
             rec["height"],
             rec["orientation"],
-            rec["path"],
+            rec["path"],          # ← COALESCE used_at 的子查询参数
+            rec["path"],          # ← COALESCE used_count 的子查询参数
             rec["exif_json"],
             rec["raw_json"],
             rec["exif_datetime"],
@@ -1413,6 +1952,10 @@ def main():
                         help="本次最多处理 N 张（覆盖 config.BATCH_LIMIT，供 Token 感知调度限流）")
     parser.add_argument("--rescan", action="store_true",
                         help="重新扫描：跳过 filter_unscored，对目录里所有照片（含已入库）重新打分（INSERT OR REPLACE 覆盖更新）")
+    parser.add_argument("--dedupe-only", action="store_true",
+                        help="只建立/更新去重索引并标记重复项，不调用 VLM 打分（可独立 cron 调度）")
+    parser.add_argument("--dedupe-reindex", action="store_true",
+                        help="配合 --dedupe-only：忽略已有索引全部重算（默认只补未索引/文件已变的）")
     args = parser.parse_args()
 
     # 应用 Web 设置页保存的动态配置（API key / 屏幕 / 阈值），并重建渠道状态
@@ -1474,11 +2017,11 @@ def main():
     if not imgs:
         raise SystemExit(f"目录下没有图片文件: {IMAGE_DIR}")
 
-    imgs = [p for p in imgs if not is_screenshot(p)]
+    imgs = [p for p in imgs if not is_ignored(p)]
     if not imgs:
-        raise SystemExit("[INFO] 所有图片都被 Screenshot 过滤规则排除了，没有可处理的图片。")
+        raise SystemExit("[INFO] 所有图片都被忽略规则（截图/NAS 缩略图目录）排除了，没有可处理的图片。")
 
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = open_db()
     ensure_table(conn)
     city_resolver = get_city_resolver()
 
@@ -1550,6 +2093,39 @@ def main():
     ).fetchone()[0]
     print(f"[INFO] 数据库中已有 {counted} 张已分析照片（仅统计当前目录）。")
 
+    # ---------- 只做去重：独立任务，不碰 VLM、不烧额度 ----------
+    # 单独成一个模式（而不是并进扫描主流程）的理由：首次全量建索引要读遍 NAS 上
+    # 每个文件（8000 张可能要几十分钟），塞进扫描里会跟 token 调度的窗口抢时间，
+    # 而且一旦被 batch_limit 之类截断，索引就残缺了。
+    if args.dedupe_only:
+        freed = orphan_recheck(conn)
+        if freed:
+            print(f"[INFO] 已释放 {freed} 条失效的重复标记（其保留者已删除或已失效）")
+        print(f"[INFO] 开始建立去重索引，共 {len(imgs)} 张……")
+        report_scan_progress(0, len(imgs), phase="dedupe", current="", detail="建立去重索引")
+        t_dedupe = time.time()
+
+        def _dedupe_progress(done: int, total_: int, phase: str) -> None:
+            report_scan_progress(done, total_, phase="dedupe", current="",
+                                 detail=f"{phase} {done}/{total_}")
+
+        stats = run_dedupe(
+            conn, imgs,
+            enable_similar=bool(getattr(cfg, "DEDUPE_SIMILAR_ENABLED", True)),
+            hamming_max=int(getattr(cfg, "DEDUPE_HAMMING_MAX", 6)),
+            enable_burst=bool(getattr(cfg, "DEDUPE_BURST_ENABLED", True)),
+            burst_gap=int(getattr(cfg, "DEDUPE_BURST_GAP_SEC", 3)),
+            reindex=bool(args.dedupe_reindex),
+            progress_cb=_dedupe_progress,
+        )
+        print(f"[OK] 去重索引完成，用时 {time.time() - t_dedupe:.1f}s："
+              f"本次新算 {stats['newly_indexed']} 张 / 共索引 {stats['indexed']} 张 / "
+              f"标记重复 {stats['duplicates']} 张 "
+              f"（内容相同 {stats['exact']}、连拍 {stats['burst']}、视觉相似 {stats['similar']}）")
+        conn.close()
+        clear_scan_progress()
+        return
+
     # 重新扫描：跳过 filter_unscored，全量重扫（含已入库）；否则只扫未入库的新照片
     is_rescan = bool(args.rescan) or (os.environ.get("INKTIME_RESCAN") == "1")
     if is_rescan:
@@ -1561,6 +2137,18 @@ def main():
             print("[INFO] 所有图片都已经在 photo_scores 中有记录。")
             conn.close()
             return
+
+    # 跳过已判定为重复的照片 —— 这正是去重省 token 的地方。
+    # 重扫（--rescan）也同样跳过：否则重扫会把每一张重复照片重新送一遍 VLM，
+    # 去重就完全白做了。要让某张重复照片重新参与，重算去重索引即可。
+    # 放在 batch 截断【之前】：重复照片不该占用本批的额度名额。
+    dup_map = load_dup_map(conn)
+    if dup_map:
+        before_dup = len(target_paths)
+        target_paths = [p for p in target_paths if str(p) not in dup_map]
+        skipped_dup = before_dup - len(target_paths)
+        if skipped_dup:
+            print(f"[INFO] 已跳过 {skipped_dup} 张判定为重复的照片（不送 VLM 打分，省额度）")
 
     if args.batch_limit is not None and args.batch_limit > 0:
         target_paths = target_paths[:args.batch_limit]
@@ -1584,7 +2172,9 @@ def main():
     report_scan_progress(already_done, total, phase="prepare", current="", detail=f"共 {len(target_paths)} 张待处理")
 
     cur = conn.cursor()
-    db_lock = threading.Lock()   # 保护 SQLite 写入操作
+    # 用 RLock 而非 Lock：当前没有嵌套加锁，但一旦将来在持锁区间里调用另一个
+    # 也会加锁的辅助函数，Lock 会直接死锁且没有任何提示；RLock 成本为零。
+    db_lock = threading.RLock()   # 保护 SQLite 写入操作
     start_time = time.time()
 
     if concurrency <= 1:

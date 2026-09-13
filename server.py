@@ -8,6 +8,7 @@ from flask import Flask, abort, send_file, Response, request, redirect
 import mimetypes
 import sqlite3
 import json
+import hmac
 import html
 import os
 import config as cfg
@@ -20,12 +21,14 @@ register_heif()
 import threading
 import subprocess
 import shlex
+import signal
 import sys
 import time
 from datetime import datetime, timedelta
 from croniter import croniter
 import web_settings
 import requests
+from urllib.parse import quote
 
 ROOT_DIR = Path(__file__).resolve().parent
 
@@ -211,6 +214,36 @@ def _should_fire_analyze(now: datetime) -> tuple[bool, int, str]:
 _SCHED_TICK_SEC = 20.0  # 调度线程每 20s 醒来检查一次
 
 
+def _kill_process_group(p: subprocess.Popen, grace: float = 5.0) -> None:
+    """终止子进程【及其整个进程组】。
+
+    子进程是用 `sh -c "... | tee -a log"` 起的，Popen 拿到的是 sh 的句柄。
+    只 terminate 它会留下真正干活的 Python 子进程继续跑 —— analyze 会接着烧额度，
+    render 会和下一次渲染抢写同一批输出目录。所以按进程组发信号。
+    这要求 spawn 时设了 start_new_session=True：否则子进程与 server 同组，
+    killpg 会把 server 自己一起杀掉。
+    """
+    if p.poll() is not None:
+        return
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            p.terminate()
+    else:
+        p.terminate()          # Windows 开发环境没有 killpg
+    try:
+        p.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        p.kill()
+
+
 class Scheduler:
     """轻量后台调度器：按 cron 表达式拉起 analyze/render 子进程。
 
@@ -250,6 +283,19 @@ class Scheduler:
                 "last_run": None,
                 "quota_gated": False,
             },
+            {
+                # 去重索引：独立任务。首次全量要读遍 NAS 上每个文件（可能几十分钟），
+                # 所以刻意不并进扫描流程 —— 那会跟 token 调度的窗口抢时间。
+                # 建立之后的增量很快（只处理新文件/大小变了的）。
+                "name": "dedupe",
+                "cron": s.get("dedupe_cron", "0 2 * * *"),
+                "enabled": bool(s.get("dedupe_enabled", True)),
+                "cmd": [sys.executable, str(ROOT_DIR / "analyze_photos.py"), "--dedupe-only"],
+                "log": "dedupe.log",
+                "next_run": None,
+                "last_run": None,
+                "quota_gated": False,   # 不调 VLM，不烧额度，无需 token 门控
+            },
         ]
         with self._lock:
             self.jobs = jobs
@@ -286,6 +332,7 @@ class Scheduler:
             "jobs": jobs,
             "quota": self._quota_status,
             "scan_running": self.is_analyze_running(),
+            "render_running": self.is_render_running(),
         }
 
     def _spawn(self, job: dict, now: datetime) -> None:
@@ -327,6 +374,7 @@ class Scheduler:
             ["sh", "-c", shell_cmd],
             cwd=str(ROOT_DIR),
             env=env,
+            start_new_session=True,   # 自成进程组，停止时能整组干掉（见 _kill_process_group）
         )
         with self._lock:
             self._proc[name] = proc
@@ -384,6 +432,7 @@ class Scheduler:
             ["sh", "-c", shell_cmd],
             cwd=str(ROOT_DIR),
             env=env,
+            start_new_session=True,   # 自成进程组，停止时能整组干掉（见 _kill_process_group）
         )
         with self._lock:
             self._proc["analyze"] = proc
@@ -400,11 +449,7 @@ class Scheduler:
         if p is None or p.poll() is not None:
             return False, "当前没有在扫描"
         try:
-            p.terminate()   # 先温和终止
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                p.kill()    # 5 秒内没停就强杀
+            _kill_process_group(p)
             print("[scheduler] 手动停止扫描")
             return True, "已停止扫描"
         except Exception as e:
@@ -413,6 +458,66 @@ class Scheduler:
     def is_analyze_running(self) -> bool:
         p = self._proc.get("analyze")
         return p is not None and p.poll() is None
+
+    # ---------- 手动出图（「换一张」按钮） ----------
+
+    def is_render_running(self) -> bool:
+        p = self._proc.get("render")
+        return p is not None and p.poll() is None
+
+    def start_job_manual(self, name: str, extra_args: list[str] | None = None,
+                         msg_ok: str = "已开始") -> tuple[bool, str]:
+        """手动拉起某个 job（网页按钮用）。
+
+        用 _proc[name] 槽位做互斥：连点两次不会起两个进程抢写同一批文件。
+        不注入 INKTIME_BATCH_LIMIT —— render/dedupe 都不调 VLM、不烧额度
+        （只有 analyze 需要额度门控，它有专门的 start_analyze_manual）。
+        """
+        job = self._get_job(name)
+        if job is None:
+            return False, f"找不到任务 {name}"
+        p = self._proc.get(name)
+        if p is not None and p.poll() is None:
+            return False, "该任务正在运行，请稍候"
+
+        cmd = list(job["cmd"]) + list(extra_args or [])
+        env = dict(os.environ)
+        log_path = LOG_DIR / job["log"]
+        now = datetime.now()
+        shell_cmd = f"{shlex.join(cmd)} 2>&1 | tee -a {shlex.quote(str(log_path))}"
+        print(f"[{now:%F %T}] [scheduler] 手动启动 {name} {' '.join(extra_args or '')}".rstrip())
+        proc = subprocess.Popen(
+            ["sh", "-c", shell_cmd],
+            cwd=str(ROOT_DIR),
+            env=env,
+            start_new_session=True,
+        )
+        with self._lock:
+            self._proc[name] = proc
+            for j in self.jobs:
+                if j["name"] == name:
+                    j["next_run"] = datetime.now() + timedelta(seconds=_SCHED_TICK_SEC)
+        return True, msg_ok
+
+    def start_render_manual(self, extra_args: list[str] | None = None) -> tuple[bool, str]:
+        """网页点「换一张」：立刻重选一批照片出图并覆盖 latest.bin。"""
+        return self.start_job_manual(
+            "render", extra_args, "已开始换一张，稍等几秒刷新即可看到新图")
+
+    def start_dedupe_manual(self) -> tuple[bool, str]:
+        """网页点「重建去重索引」：跑一次 analyze_photos.py --dedupe-only。"""
+        return self.start_job_manual(
+            "dedupe", None, "已开始重建去重索引（首次全量较慢，之后是增量）")
+
+    def stop_render_manual(self) -> tuple[bool, str]:
+        p = self._proc.get("render")
+        if p is None or p.poll() is not None:
+            return False, "当前没有在出图"
+        try:
+            _kill_process_group(p)
+            return True, "已停止出图"
+        except Exception as e:
+            return False, f"停止失败：{e}"
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -475,7 +580,7 @@ def _load_all_md_list() -> list[str]:
         if isinstance(cached, list):
             return [str(x) for x in cached]
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _open_db()
     c = conn.cursor()
     rows = c.execute("SELECT exif_json FROM photo_scores").fetchall()
     conn.close()
@@ -500,11 +605,42 @@ def _require_webui_enabled() -> None:
 
 
 def _safe_join(base: Path, rel: str) -> Path:
-    """防目录穿越：只允许 base 下的相对路径"""
+    """防目录穿越：只允许 base 下的相对路径。
+
+    用 is_relative_to 而非字符串前缀比较 —— 前缀比较会把同级的
+    output_evil/ 误判成 output/ 的子路径放行。
+    """
+    root = base.resolve()
     p = (base / rel).resolve()
-    if not str(p).startswith(str(base.resolve())):
+    if not p.is_relative_to(root):
         raise ValueError("path traversal blocked")
     return p
+
+
+def _check_download_key(key: str) -> None:
+    """校验 ESP 下载密钥。
+
+    用 hmac.compare_digest 而非 == —— 后者是逐字符短路比较，理论上可从
+    响应耗时侧信道推断密钥。这个 key 是守护用户整个照片库的 bearer token。
+    """
+    if not hmac.compare_digest(str(key), str(DOWNLOAD_KEY)):
+        abort(404)
+
+
+def _open_db() -> sqlite3.Connection:
+    """打开 photos.db（复用 analyze_photos.open_db 的 WAL / busy_timeout 设置）。
+
+    延迟 import analyze_photos：它拉 requests 等一批依赖，模块顶层 import 会
+    拖慢 server 启动，而网页多数请求并不需要它。import 失败则退回裸连接 ——
+    网页只读查询不该因为分析模块出问题而整体不可用。
+    """
+    try:
+        import analyze_photos
+        # 显式传本模块的 DB_PATH —— open_db 默认用 analyze_photos 的库路径，
+        # 两者生产环境一致，但传参才不会在路径被改写时静默连错库。
+        return analyze_photos.open_db(DB_PATH)
+    except Exception:
+        return sqlite3.connect(DB_PATH, timeout=30.0)
 
 
 def _send_static_file(p: Path) -> Response:
@@ -518,6 +654,74 @@ def _send_static_file(p: Path) -> Response:
     if mt:
         return send_file(p, mimetype=mt, as_attachment=False)
     return send_file(p, as_attachment=False)
+
+
+# ---------- 相框设备回执 ----------
+# 不改固件：设备每次拉 bin 都要经过 esp_* 路由，顺手记下"谁在什么时候拉了哪个文件"。
+# 固件一接入，设置页立刻就有在线状态可看。
+_DEVICE_STATE_PATH = LOG_DIR / "device_state.json"
+_DEVICE_LOCK = threading.Lock()
+_DEVICE_STATE: dict | None = None        # 进程内缓存，避免每次请求都读盘
+_DEVICE_LAST_FLUSH = 0.0
+_DEVICE_FLUSH_INTERVAL = 10.0            # 最快每 10 秒落一次盘
+_DEVICE_RECENT_MAX = 50                  # 环形缓冲长度
+
+
+def _load_device_state() -> dict:
+    global _DEVICE_STATE
+    if _DEVICE_STATE is None:
+        try:
+            _DEVICE_STATE = json.loads(_DEVICE_STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            _DEVICE_STATE = {}
+        if not isinstance(_DEVICE_STATE, dict):
+            _DEVICE_STATE = {}
+        _DEVICE_STATE.setdefault("recent", [])
+        _DEVICE_STATE.setdefault("by_target", {})
+        _DEVICE_STATE.setdefault("pull_count", 0)
+    return _DEVICE_STATE
+
+
+def _write_device_state(st: dict) -> None:
+    """原子写（tmp + os.replace）—— 否则并发读会读到半个 JSON。"""
+    try:
+        _DEVICE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _DEVICE_STATE_PATH.with_name(_DEVICE_STATE_PATH.name + ".tmp")
+        tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, _DEVICE_STATE_PATH)
+    except Exception as e:
+        print(f"[WARN] 写设备状态失败（不影响拉取）: {e}")
+
+
+def _touch_device(screen: str, direction: str, filename: str) -> None:
+    """记录一次设备拉取。
+
+    设备刷新一轮会并发发起多个请求，所以这里有三个讲究：
+      · 模块级锁保护读改写，否则并发下丢更新、甚至写出坏 JSON；
+      · 状态留在进程内存，最多每 10 秒落一次盘，不然每个请求都要重写文件；
+      · 落盘走原子写。
+    """
+    global _DEVICE_LAST_FLUSH
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    try:
+        ip = request.remote_addr or ""
+        ua = (request.headers.get("User-Agent") or "")[:120]
+    except Exception:
+        ip, ua = "", ""      # 非请求上下文（例如被单测直接调用）
+    with _DEVICE_LOCK:
+        st = _load_device_state()
+        st["last_seen_at"] = now_iso
+        st["last_ip"] = ip
+        st["last_ua"] = ua
+        st["pull_count"] = int(st.get("pull_count") or 0) + 1
+        target = f"{screen}/{direction}" if screen else "顶层(兼容路径)"
+        st["by_target"][target] = {"last_file": filename, "at": now_iso}
+        st["recent"].insert(0, {"at": now_iso, "screen": screen,
+                                "direction": direction, "filename": filename})
+        del st["recent"][_DEVICE_RECENT_MAX:]
+        if time.monotonic() - _DEVICE_LAST_FLUSH >= _DEVICE_FLUSH_INTERVAL:
+            _write_device_state(st)
+            _DEVICE_LAST_FLUSH = time.monotonic()
 
 
 def _send_image(p: Path) -> Response:
@@ -565,7 +769,7 @@ def ensure_review_table():
     """
     try:
         import analyze_photos
-        conn = sqlite3.connect(DB_PATH)
+        conn = _open_db()
         analyze_photos.ensure_table(conn)
         conn.close()
     except Exception as e:
@@ -591,7 +795,7 @@ def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", so
 
     # 表不一定存在（analyze 未跑过）。做一个轻量探测，失败则按空库返回。
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = _open_db()
         # 探测表是否存在
         conn.execute("SELECT 1 FROM photo_scores LIMIT 1")
     except sqlite3.OperationalError:
@@ -639,16 +843,20 @@ def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", so
 
     # 排序
     sort = (sort or "memory").strip()
+    # ⚠️ 下面的 path 必须写全 photo_scores.path：LEFT JOIN photo_hashes 之后两表都有
+    # path 列，裸写 path 会报 "ambiguous column name"
     if sort == "beauty":
-        order_sql = "ORDER BY COALESCE(beauty_score, -1) DESC, COALESCE(memory_score, -1) DESC, path"
+        order_sql = ("ORDER BY COALESCE(beauty_score, -1) DESC, "
+                     "COALESCE(memory_score, -1) DESC, photo_scores.path")
     elif sort == "time_new":
         # 直接按 datetime 字符串排序（固定格式下可按字典序比较）；NULL 放最后
-        order_sql = f"ORDER BY ({dt_expr} IS NULL) ASC, {dt_expr} DESC, path"
+        order_sql = f"ORDER BY ({dt_expr} IS NULL) ASC, {dt_expr} DESC, photo_scores.path"
     elif sort == "time_old":
-        order_sql = f"ORDER BY ({dt_expr} IS NULL) ASC, {dt_expr} ASC, path"
+        order_sql = f"ORDER BY ({dt_expr} IS NULL) ASC, {dt_expr} ASC, photo_scores.path"
     else:
         # 默认 memory
-        order_sql = "ORDER BY COALESCE(memory_score, -1) DESC, COALESCE(beauty_score, -1) DESC, path"
+        order_sql = ("ORDER BY COALESCE(memory_score, -1) DESC, "
+                     "COALESCE(beauty_score, -1) DESC, photo_scores.path")
 
     # 分页偏移量（第 588 行 SQL 里的 OFFSET ? 用）
     offset = (page - 1) * page_size
@@ -656,8 +864,21 @@ def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", so
     # is_meaningful 列可能不存在（旧库），缺列时用 NULL 占位，避免 SELECT 报错
     meaning_col = "is_meaningful" if has_meaningful_col else "NULL AS is_meaningful"
 
+    # 去重标记在独立的 photo_hashes 表里，可能整张表都还没建（从未跑过去重任务）
+    try:
+        has_hash_table = bool(c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='photo_hashes'").fetchone())
+    except Exception:
+        has_hash_table = False
+    if has_hash_table:
+        dup_cols = "ph.dup_of, ph.dup_kind"
+        dup_join = "LEFT JOIN photo_hashes ph ON ph.path = photo_scores.path"
+    else:
+        dup_cols = "NULL AS dup_of, NULL AS dup_kind"
+        dup_join = ""
+
     base_sql = f"""
-        SELECT path,
+        SELECT photo_scores.path,
                caption,
                type,
                memory_score,
@@ -669,8 +890,10 @@ def load_rows(page: int = 1, page_size: int = REVIEW_PAGE_SIZE, md: str = "", so
                orientation,
                used_at,
                side_caption,
-               {meaning_col}
+               {meaning_col},
+               {dup_cols}
         FROM photo_scores
+        {dup_join}
         {where_sql}
         {order_sql}
         LIMIT ? OFFSET ?
@@ -687,7 +910,7 @@ def load_sim_rows():
     if not DB_PATH.exists():
         raise SystemExit(f"找不到数据库文件: {DB_PATH}")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _open_db()
     c = conn.cursor()
 
     rows = c.execute(
@@ -732,7 +955,7 @@ def load_sim_rows_for_dates(dates: list[str]):
     if not safe_dates:
         return []
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _open_db()
     c = conn.cursor()
 
     dt_expr = "json_extract(exif_json, '$.datetime')"
@@ -773,7 +996,7 @@ def get_photo_meta_by_path(abs_path: str):
     if not DB_PATH.exists():
         return None
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _open_db()
     c = conn.cursor()
     row = c.execute(
         """
@@ -965,7 +1188,15 @@ pollGlobalTasks();
 def build_html(rows, page: int, page_size: int, total_count: int):
     items_html = []
 
-    for path, caption, ptype, m_score, b_score, reason, exif_json, width, height, orientation, used_at, side_caption, _meaningful in rows:
+    # 当前列表页的完整 URL（含分页/筛选/排序），编码后带给 /sim，这样它"返回"时
+    # 能回到同一页同一筛选，而不是永远跳回第一页。
+    try:
+        back_url = (request.full_path or "/review").rstrip("?")
+    except Exception:
+        back_url = "/review"
+    back_q = quote(back_url, safe="")
+
+    for path, caption, ptype, m_score, b_score, reason, exif_json, width, height, orientation, used_at, side_caption, _meaningful, _dup_of, _dup_kind in rows:
         safe_caption = html.escape(caption or "").replace("\n", "<br>")
         safe_side = html.escape(side_caption or "").replace("\n", "<br>")
         safe_type = html.escape(ptype or "")
@@ -989,6 +1220,12 @@ def build_html(rows, page: int, page_size: int, total_count: int):
                 res_str = f"{width} x {height}"
         orient_str = orientation or ""
         used_str = used_at or ""
+        # 去重标记：这张被判定为冗余，dup_of 指向保留的那张
+        dup_html = ""
+        if _dup_of:
+            kind_zh = {"exact": "内容相同", "burst": "连拍", "similar": "视觉相似"}.get(
+                _dup_kind or "", "重复")
+            dup_html = f' · <span style="color:#e08a3c">🔁 {kind_zh}，未送打分</span>'
 
         img_uri = _make_image_url(str(path))
         if not img_uri:
@@ -1015,7 +1252,7 @@ def build_html(rows, page: int, page_size: int, total_count: int):
              data-memory="{m_score if m_score is not None else ''}"
              data-beauty="{b_score if b_score is not None else ''}">
             <div class="img-wrap">
-                <a class="img-link" href="/sim?img={html.escape(img_uri)}" title="打开该照片的模拟器" onclick="window.stop();">
+                <a class="img-link" href="/sim?img={quote(img_uri, safe='')}&back={back_q}" title="打开该照片的模拟器" onclick="window.stop(); rememberScroll();">
                     <img src="{img_uri}" loading="lazy">
                 </a>
             </div>
@@ -1031,6 +1268,7 @@ def build_html(rows, page: int, page_size: int, total_count: int):
                     {(" · 分辨率: " + html.escape(res_str)) if res_str else ""}
                     {(" · 方向: " + html.escape(orient_str)) if orient_str else ""}
                     {(" · 已上屏: " + html.escape(used_str)) if used_str else ""}
+                    {dup_html}
                 </div>
                 <div class="caption">{safe_caption}</div>
             </div>
@@ -1543,6 +1781,29 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       }}).catch(()=>{{}});
       setTimeout(pollGlobalTasks, 2000);
     }}
+
+    // 列表滚动位置记忆：点进模拟器再返回时，回到原来的位置。
+    // 只按「路径+查询串」匹配，所以翻页/换筛选后不会错误地跳到别处。
+    function rememberScroll(){{
+      try{{
+        sessionStorage.setItem('inktime_scroll', JSON.stringify({{
+          url: location.pathname + location.search,
+          y: Math.round(window.scrollY)
+        }}));
+      }}catch(e){{}}
+    }}
+    (function restoreScroll(){{
+      try{{
+        const raw = sessionStorage.getItem('inktime_scroll');
+        if(!raw) return;
+        const d = JSON.parse(raw);
+        if(!d || d.url !== location.pathname + location.search || !d.y) return;
+        const jump = () => window.scrollTo(0, d.y);
+        jump();                                   // 先试一次
+        window.addEventListener('load', jump);    // 图片加载完、高度稳定后再对齐
+        setTimeout(jump, 400);
+      }}catch(e){{}}
+    }})();
   </script>
 </body>
 </html>
@@ -1550,7 +1811,7 @@ def build_html(rows, page: int, page_size: int, total_count: int):
     return html_str
 
 
-def build_simulator_html(sim_rows, selected_img: str = ""):
+def build_simulator_html(sim_rows, selected_img: str = "", back_url: str = "/review"):
     # 空数据时不要做任何无意义的循环，避免前端 JS 大对象
     if not sim_rows:
         sim_rows = []
@@ -1560,6 +1821,17 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
     _screen = dict(getattr(cfg, "SCREEN", {}) or {})
     CANVAS_W = int(_screen.get("width", 480))
     CANVAS_H = int(_screen.get("height", 800))
+
+    # 屏幕下拉：详情页切换分辨率用（列出已启用的屏）
+    _opts = []
+    for _s in (getattr(cfg, "SCREENS", None) or []):
+        if not isinstance(_s, dict) or not _s.get("enabled", True):
+            continue
+        _nm = str(_s.get("name", ""))
+        _w, _h = int(_s.get("width", 0)), int(_s.get("height", 0))
+        if _nm and _w > 0 and _h > 0:
+            _opts.append(f'<option value="{html.escape(_nm)}">{html.escape(_nm)} · {_w}×{_h}</option>')
+    screen_opts = "".join(_opts)
 
     def _parse_tags(ptype_val) -> list[str]:
         """把 DB 的 type 字段解析成 tag 数组。
@@ -1740,14 +2012,18 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
     .preview-wrap {{
       display:flex;
       flex-wrap:wrap;
-      gap: 16px;
+      gap: 20px;
       align-items: flex-start;
     }}
     .canvas-box {{
+      /* 画布容器固定一个宽度：横图 800 宽也等比缩进同一栏，于是
+         ① 横竖切换时布局不跳动；② 信息区永远在右侧，不会被挤到下一行。 */
+      flex: 0 0 auto;
+      width: min(440px, 100%);
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: var(--radius);
-      padding: 10px;
+      padding: 12px;
       box-shadow: var(--shadow2);
       backdrop-filter: blur(10px);
     }}
@@ -1758,12 +2034,30 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
     }}
     #previewCanvas {{
       display:block;
+      width:100%;            /* 在容器内等比缩放：横图 800 宽也缩到同一栏宽 */
+      height:auto;
       background:#fff;
       border: 1px solid rgba(255,255,255,0.18);
       border-radius: 10px;
-      max-width:100%;        /* 横向大图窄屏不溢出 */
-      height:auto;
     }}
+    .sel-wrap {{
+      display:inline-flex;
+      align-items:center;
+      gap:7px;
+      font-size:13px;
+      color:var(--muted);
+      margin-left:auto;      /* 推到控制栏右端，和左边的按钮拉开层次 */
+    }}
+    .sel-wrap select {{
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      padding: 7px 10px;
+      font-size: 13px;
+      cursor: pointer;
+    }}
+    .sel-wrap select:focus {{ outline:none; border-color: rgba(255,255,255,0.34); }}
 
     .meta-box {{
       flex: 1;
@@ -1771,7 +2065,7 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: var(--radius);
-      padding: 12px;
+      padding: 16px 18px;
       box-shadow: var(--shadow2);
       backdrop-filter: blur(10px);
       font-size: 16px;
@@ -2016,11 +2310,11 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
 </head>
 <body>
   <div class="container">
-    <a class="back" href="/review">← 返回 Review</a>
+    <a class="back" href="{html.escape(back_url)}">← 返回 Review</a>
     <a class="back" href="/settings" style="margin-left:14px">⚙ 设置</a>
     <h1>墨水屏渲染效果预览</h1>
     <div class="subtitle">
-      屏幕尺寸：{CANVAS_W} x {CANVAS_H}&nbsp;&nbsp;
+      画布：<span id="canvasSize">{CANVAS_W} × {CANVAS_H}</span>&nbsp;&nbsp;
       <span style="display:inline-flex; gap:6px; vertical-align:middle;">
         <span style="width:10px;height:10px;box-sizing:border-box;border-radius:50%;background:#000;border:1px solid rgba(255,255,255,0.70);"></span>
         <span style="width:10px;height:10px;box-sizing:border-box;border-radius:50%;background:#fff;border:1px solid rgba(255,255,255,0.45);"></span>
@@ -2031,6 +2325,9 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
 
     <div class="controls">
       <button type="button" id="rerollBtn">同一天换一张</button>
+      <label class="sel-wrap">屏幕
+        <select id="screenSel">{screen_opts}</select>
+      </label>
     </div>
 
     <div class="status" id="statusLine"></div>
@@ -2112,6 +2409,7 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
     const canvas = document.getElementById('previewCanvas');
     const ctx = canvas.getContext('2d');
     const statusLine = document.getElementById('statusLine');
+    const screenSel = document.getElementById('screenSel');   // 分辨率切换下拉
 
     const kpiDate = document.getElementById('kpiDate');
     const kpiLocation = document.getElementById('kpiLocation');
@@ -2383,11 +2681,16 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
           canvas.width = img.naturalWidth || img.width;
           canvas.height = img.naturalHeight || img.height;
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          // 画布尺寸标注跟着实际渲染结果走（换屏幕、横竖切换都会变）
+          const sz = document.getElementById('canvasSize');
+          if (sz) sz.textContent = canvas.width + ' × ' + canvas.height;
         }};
       img.onerror = function() {{
         statusLine.textContent = '图片加载失败：' + photo.path;
       }};
-      img.src = '/sim_render?img=' + encodeURIComponent(photo.path);
+      const scr = screenSel ? screenSel.value : '';
+      img.src = '/sim_render?img=' + encodeURIComponent(photo.path)
+              + (scr ? '&screen=' + encodeURIComponent(scr) : '');
     }}
 
     function pickPhotoFromDate(date) {{
@@ -2475,6 +2778,13 @@ def build_simulator_html(sim_rows, selected_img: str = ""):
     }}
 
     document.getElementById('rerollBtn').addEventListener('click', onRerollSameDay);
+
+    // 换屏幕：重画当前这张（方向由照片自身决定，所以只有画布尺寸变）
+    if (screenSel) {{
+      screenSel.addEventListener('change', () => {{
+        if (currentPhoto) drawPreview(currentPhoto);
+      }});
+    }}
 
     // 默认进入：如果从 review 点进来，则显示该照片；否则提示用户从 review 进入
     const initPhoto = findSelectedPhoto();
@@ -2593,6 +2903,49 @@ def api_scan_stop():
     _require_webui_enabled()
     ok, msg = scheduler.stop_analyze_manual()
     return Response(json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False), mimetype="application/json")
+
+
+@app.post("/api/next")
+def api_next():
+    """网页点「换一张」：立刻重选一批照片出图，覆盖 latest.bin。
+
+    渲染进程走 --next：优先排除最近已出过图的照片。不烧 VLM 额度（只读库+出图）。
+    """
+    _require_webui_enabled()
+    ok, msg = scheduler.start_render_manual(extra_args=["--next"])
+    return Response(json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False), mimetype="application/json")
+
+
+@app.post("/api/render/stop")
+def api_render_stop():
+    _require_webui_enabled()
+    ok, msg = scheduler.stop_render_manual()
+    return Response(json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False), mimetype="application/json")
+
+
+@app.post("/api/dedupe/start")
+def api_dedupe_start():
+    """网页点「重建去重索引」：跑一次 analyze_photos.py --dedupe-only。
+
+    不烧 VLM 额度（只算哈希、不调模型），所以不走 token 门控。
+    """
+    _require_webui_enabled()
+    ok, msg = scheduler.start_dedupe_manual()
+    return Response(json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False), mimetype="application/json")
+
+
+@app.get("/api/device")
+def api_device():
+    """相框设备的最后上线 / 拉取记录。
+
+    数据完全来自 esp 下载路由的被动记录 —— 固件一个字不用改。当前还没有实体
+    设备，所以这里会是空的；等固件接入，设置页立刻就有在线状态可看。
+    """
+    _require_webui_enabled()
+    with _DEVICE_LOCK:
+        st = dict(_load_device_state())
+        st["recent"] = list(st.get("recent") or [])[:20]
+    return Response(json.dumps(st, ensure_ascii=False), mimetype="application/json")
 
 
 @app.get("/api/scan/progress")
@@ -2732,12 +3085,14 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 </details>
 
 <details class="fold" open>
-<summary>自动任务（新增照片 / 每日出图）</summary>
+<summary>自动任务（新增照片 / 每日出图 / 去重索引）</summary>
 <div class="hint">下面两件事会自动跑：<b>①扫描新照片</b>＝把相册里没打过分的新照片送去打分、写文案；<b>②每日出图</b>＝每天挑一张「历史上的今天」渲染成墨水屏能显示的图片。填「分 时 日 月 周」五个数字，看不懂没关系，选右边的常用档位会自动帮你填。</div>
 <div class="kv"><label>扫描新照片</label><input type="text" id="analyze_cron" placeholder="30 3 * * *" style="grid-column:1"><label style="display:flex;gap:6px"><input type="checkbox" id="analyze_enabled">开启</label></div>
 <div class="cron-chips" id="analyze_chips"></div>
 <div class="kv"><label>每日出图</label><input type="text" id="render_cron" placeholder="5 4 * * *" style="grid-column:1"><label style="display:flex;gap:6px"><input type="checkbox" id="render_enabled">开启</label></div>
 <div class="cron-chips" id="render_chips"></div>
+<div class="kv"><label>去重索引</label><input type="text" id="dedupe_cron" placeholder="0 2 * * *" style="grid-column:1"><label style="display:flex;gap:6px"><input type="checkbox" id="dedupe_enabled">开启</label></div>
+<div class="cron-chips" id="dedupe_chips"></div>
 <div class="hint">⭐ 每个任务下方会实时显示成一句人话：<span id="analyze_hint" class="ok"></span></div>
 <div class="hint">⭐ 每日出图同样：<span id="render_hint" class="ok"></span></div>
 <div class="controls" style="margin:10px 0;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;">
@@ -2752,6 +3107,20 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 </div>
 <div class="hint" style="margin-bottom:4px">「按额度烧到底线」= 立刻把没打过分的新照片送去打分，按剩余额度自动算出该扫多少张，把额度用到底线（不受空闲时段限制），进度条实时显示。</div>
 <div class="statusline" id="statusBox">尚未查看调度状态</div>
+</details>
+
+<details class="fold">
+<summary>相框设备（最后上线 / 换一张）</summary>
+<div class="hint">数据来自相框每次拉取图片时的被动记录，固件不需要任何改动。还没有设备接入时这里会是空的。</div>
+<div class="kv"><label>最后上线</label><span id="dev_last_seen" style="grid-column:2/-1">—</span></div>
+<div class="kv"><label>最后拉取</label><span id="dev_last_file" style="grid-column:2/-1">—</span></div>
+<div class="kv"><label>设备地址</label><span id="dev_last_ip" style="grid-column:2/-1">—</span></div>
+<div class="kv"><label>累计拉取</label><span id="dev_pull_count" style="grid-column:2/-1">—</span></div>
+<div class="kv"><label>操作</label><span style="grid-column:2/-1;display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" onclick="doNext()">🔀 换一张</button>
+<button type="button" onclick="refreshDevice()">刷新状态</button>
+</span></div>
+<div class="q-note" id="dev_note">「换一张」会立刻重选一批照片出图并覆盖 latest.bin（优先排除最近已出过图的照片），相框下次轮询就能看到新图。</div>
 </details>
 
 <details class="fold">
@@ -2774,6 +3143,17 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 <div class="hint">▲ 低于这个回忆度的照片默认不在主页显示。勾"显示低分"才能看到它们。</div>
 <div class="kv"><label>主页隐藏无意义</label><label style="display:flex;gap:6px"><input type="checkbox" id="home_hide_unmeaningful">隐藏</label></div>
 <div class="hint">▲ 勾选后，被 AI 判定为"无意义"（截图/收据/杂物）的照片也不在主页显示。</div>
+<div class="kv"><label>扫描跳过重复照片</label><label style="display:flex;gap:6px"><input type="checkbox" id="cfg_dedupe_enabled">跳过</label></div>
+<div class="hint">▲ 开启后，被去重索引判定为重复的照片不再送去打分（省额度）。索引由上面「自动任务 → 去重索引」定时重建，也可以在下面手动重建。</div>
+<div class="kv"><label>视觉相似判定</label><label style="display:flex;gap:6px"><input type="checkbox" id="cfg_dedupe_similar">启用</label></div>
+<div class="hint">▲ 用感知哈希确认两张图是否真的像。关掉会退化成"拍摄时间接近就算重复"——那会误杀连拍里构图不同的照片。</div>
+<div class="kv"><label>相似度阈值</label><input type="text" id="cfg_dedupe_hamming" placeholder="6"></div>
+<div class="hint">▲ 汉明距离 0~64，越小越严格。默认 6 比较稳；超过 8 开始容易把不同的照片判成重复。</div>
+<div class="kv"><label>连拍时间间隔（秒）</label><input type="text" id="cfg_dedupe_burst_gap" placeholder="3"></div>
+<div class="kv"><label>选片排除天数</label><input type="text" id="cfg_recent_days" placeholder="30"></div>
+<div class="hint">▲ 每天出图时跳过最近这么多天内已经上过屏的照片，避免连着几天推同一批。</div>
+<div class="kv"><label>去重索引</label><span style="grid-column:2/-1"><button type="button" onclick="rebuildDedupe()">🔍 立即重建去重索引</button></span></div>
+<div class="q-note" id="dedupe_note">首次全量重建要读遍相册里的每个文件，大相册可能要几十分钟；之后是增量，很快。</div>
 </details>
 
 <details class="fold">
@@ -2898,9 +3278,10 @@ async function initSettings(){
     const sc = s.schedule || {};
     setVal('analyze_cron', sc.analyze_cron); setChk('analyze_enabled', sc.analyze_enabled);
     setVal('render_cron', sc.render_cron);   setChk('render_enabled', sc.render_enabled);
-    renderCronChips('analyze'); renderCronChips('render');
-    refreshCronHint('analyze'); refreshCronHint('render');
-    ['analyze_cron','render_cron'].forEach(id => {
+    setVal('dedupe_cron', sc.dedupe_cron);   setChk('dedupe_enabled', sc.dedupe_enabled);
+    renderCronChips('analyze'); renderCronChips('render'); renderCronChips('dedupe');
+    refreshCronHint('analyze'); refreshCronHint('render'); refreshCronHint('dedupe');
+    ['analyze_cron','render_cron','dedupe_cron'].forEach(id => {
       const el = document.getElementById(id);
       if(el) el.addEventListener('input', () => refreshCronHint(id.replace('_cron','')));
     });
@@ -2920,6 +3301,11 @@ async function initSettings(){
     setVal('unmeaningful_threshold', c.UNMEANINGFUL_THRESHOLD);
     setVal('vlm_max_long_edge', c.VLM_MAX_LONG_EDGE || 1024);
     setVal('home_min_score', c.HOME_MIN_SCORE || 60); setChk('home_hide_unmeaningful', c.HOME_HIDE_UNMEANINGFUL);
+    setChk('cfg_dedupe_enabled', c.DEDUPE_ENABLED !== false);
+    setChk('cfg_dedupe_similar', c.DEDUPE_SIMILAR_ENABLED !== false);
+    setVal('cfg_dedupe_hamming', c.DEDUPE_HAMMING_MAX ?? 6);
+    setVal('cfg_dedupe_burst_gap', c.DEDUPE_BURST_GAP_SEC ?? 3);
+    setVal('cfg_recent_days', c.RECENT_EXCLUDE_DAYS ?? 30);
     if(document.getElementById('vlm_res_note')) document.getElementById('vlm_res_note').textContent = (c.VLM_MAX_LONG_EDGE||1024)+'px';
     // 上传分辨率滑块拖动时同步显示值
     const vlmEl = document.getElementById('vlm_max_long_edge');
@@ -2928,9 +3314,10 @@ async function initSettings(){
         if(document.getElementById('vlm_res_note')) document.getElementById('vlm_res_note').textContent = vlmEl.value + 'px';
       });
     }
-    // 进页面自动加载两次数据：额度余额 + 自动任务状态
+    // 进页面自动加载：额度余额 + 自动任务状态 + 相框在线状态
     refreshQuota();
     refreshStatus();
+    refreshDevice();
   }catch(e){ document.getElementById('saveMsg').textContent='加载设置失败: '+e; }
 }
 
@@ -2989,6 +3376,8 @@ async function saveSettings(){
       analyze_enabled: document.getElementById('analyze_enabled').checked,
       render_cron: document.getElementById('render_cron').value,
       render_enabled: document.getElementById('render_enabled').checked,
+      dedupe_cron: document.getElementById('dedupe_cron').value,
+      dedupe_enabled: document.getElementById('dedupe_enabled').checked,
     },
     screens: window.__screens || [],
     quota: {
@@ -3008,6 +3397,11 @@ async function saveSettings(){
       VLM_MAX_LONG_EDGE: parseInt(document.getElementById('vlm_max_long_edge').value||'1024'),
       HOME_MIN_SCORE: parseFloat(document.getElementById('home_min_score').value||'60'),
       HOME_HIDE_UNMEANINGFUL: document.getElementById('home_hide_unmeaningful').checked,
+      DEDUPE_ENABLED: document.getElementById('cfg_dedupe_enabled').checked,
+      DEDUPE_SIMILAR_ENABLED: document.getElementById('cfg_dedupe_similar').checked,
+      DEDUPE_HAMMING_MAX: parseInt(document.getElementById('cfg_dedupe_hamming').value||'6'),
+      DEDUPE_BURST_GAP_SEC: parseInt(document.getElementById('cfg_dedupe_burst_gap').value||'3'),
+      RECENT_EXCLUDE_DAYS: parseInt(document.getElementById('cfg_recent_days').value||'30'),
     }
   };
   try{
@@ -3052,6 +3446,56 @@ async function refreshQuota(){
     }
     box.innerHTML = html;
   }catch(e){ box.innerHTML = '<div class="err">查询失败: '+e+'</div>'; }
+}
+
+// —— 相框设备状态（数据来自设备拉取时的被动记录，固件无需改动）——
+function agoText(iso){
+  try{
+    const t = new Date(iso).getTime();
+    if(isNaN(t)) return '';
+    const s = Math.max(0, (Date.now()-t)/1000);
+    if(s < 60) return '刚刚';
+    if(s < 3600) return Math.floor(s/60)+' 分钟前';
+    if(s < 86400) return Math.floor(s/3600)+' 小时前';
+    return Math.floor(s/86400)+' 天前';
+  }catch(e){ return ''; }
+}
+async function refreshDevice(){
+  const seenEl = document.getElementById('dev_last_seen');
+  if(!seenEl) return;
+  try{
+    const d = await getJSON('/api/device');
+    const seen = d.last_seen_at || '';
+    seenEl.textContent = seen ? (seen.replace('T',' ') + '（' + agoText(seen) + '）') : '暂无设备接入';
+    const bt = d.by_target || {};
+    const k = Object.keys(bt)[0];
+    document.getElementById('dev_last_file').textContent = k ? (k + ' → ' + bt[k].last_file) : '—';
+    document.getElementById('dev_last_ip').textContent = d.last_ip || '—';
+    document.getElementById('dev_pull_count').textContent = (d.pull_count||0) + ' 次';
+  }catch(e){
+    seenEl.textContent = '读取失败：' + e;
+  }
+}
+async function doNext(){
+  const note = document.getElementById('dev_note');
+  note.textContent = '正在换一张…';
+  try{
+    const r = await getJSON('/api/next', {method:'POST'});
+    note.textContent = r.msg || (r.ok ? '已开始' : '失败');
+    if(r.ok) setTimeout(refreshDevice, 5000);
+  }catch(e){
+    note.textContent = '换一张失败：' + e;
+  }
+}
+async function rebuildDedupe(){
+  const note = document.getElementById('dedupe_note');
+  note.textContent = '正在启动去重索引…';
+  try{
+    const r = await getJSON('/api/dedupe/start', {method:'POST'});
+    note.textContent = r.msg || (r.ok ? '已开始' : '失败');
+  }catch(e){
+    note.textContent = '启动失败：' + e;
+  }
 }
 
 async function refreshStatus(){
@@ -3221,7 +3665,13 @@ def sim():
 
                 sim_rows = load_sim_rows_for_dates(dates)
 
-    html_str = build_simulator_html(sim_rows, selected_img=selected_img)
+    # 返回链接用 /review 带上来的来源页（含分页/筛选/排序），这样能回到原来那一页。
+    # 必须校验前缀，否则 back= 参数会变成开放重定向。
+    back_url = (request.args.get("back") or "/review").strip()
+    if not back_url.startswith("/review"):
+        back_url = "/review"
+
+    html_str = build_simulator_html(sim_rows, selected_img=selected_img, back_url=back_url)
     return Response(html_str, mimetype="text/html; charset=utf-8")
 
 
@@ -3264,8 +3714,18 @@ def sim_render():
             "city": "",
         }
 
+    # 详情页的分辨率切换：按屏幕名挑一块屏，未指定或名字不认识就回退默认屏。
+    # 这里不限 enabled —— 预览的用途就是提前看效果，不该因为没启用就看不到。
+    screen_name = (request.args.get("screen") or "").strip()
+    screen = None
+    if screen_name:
+        for sc in (getattr(cfg, "SCREENS", None) or []):
+            if isinstance(sc, dict) and str(sc.get("name")) == screen_name:
+                screen = sc
+                break
+
     try:
-        img, _ = rdp.render_image(meta)   # v4 返回 (canvas, orientation)
+        img, _ = rdp.render_image(meta, screen)   # v4 返回 (canvas, orientation)
         img_dithered = rdp.apply_four_color_dither(img)
 
         bio = BytesIO()
@@ -3277,27 +3737,27 @@ def sim_render():
 
 @app.get("/static/inktime/<key>/photo_<int:idx>.bin")
 def esp_photo(key: str, idx: int):
-    if key != DOWNLOAD_KEY:
-        abort(404)
+    _check_download_key(key)
     if idx < 0 or idx >= DAILY_PHOTO_QUANTITY:
         abort(404)
     p = BIN_OUTPUT_DIR / f"photo_{idx}.bin"
+    _touch_device("", "", f"photo_{idx}.bin")   # 顶层兼容路径（旧固件），同样记一笔
     return _send_static_file(p)
 
 
 @app.get("/static/inktime/<key>/latest.bin")
 def esp_latest(key: str):
-    if key != DOWNLOAD_KEY:
-        abort(404)
+    _check_download_key(key)
     p = BIN_OUTPUT_DIR / "latest.bin"
+    _touch_device("", "", "latest.bin")
     return _send_static_file(p)
 
 
 @app.get("/static/inktime/<key>/preview.png")
 def esp_preview(key: str):
-    if key != DOWNLOAD_KEY:
-        abort(404)
+    _check_download_key(key)
     p = BIN_OUTPUT_DIR / "preview.png"
+    _touch_device("", "", "preview.png")
     return _send_static_file(p)
 
 
@@ -3318,37 +3778,35 @@ def _screen_direction_path(screen: str, direction: str, filename: str) -> Path:
         p = _safe_join(BIN_OUTPUT_DIR / screen / direction, filename)
     except ValueError:
         abort(400)
+    # 所有"屏/方向"形式的下载都经过这里，顺手记一笔设备上线（不改固件）
+    _touch_device(screen, direction, filename)
     return p
 
 
 @app.get("/static/inktime/<key>/<screen>/<direction>/latest.bin")
 def esp_latest_dir(key: str, screen: str, direction: str):
-    if key != DOWNLOAD_KEY:
-        abort(404)
+    _check_download_key(key)
     p = _screen_direction_path(screen, direction, "latest.bin")
     return _send_static_file(p)
 
 
 @app.get("/static/inktime/<key>/<screen>/<direction>/photo_<int:idx>.bin")
 def esp_photo_dir(key: str, screen: str, direction: str, idx: int):
-    if key != DOWNLOAD_KEY:
-        abort(404)
+    _check_download_key(key)
     p = _screen_direction_path(screen, direction, f"photo_{idx}.bin")
     return _send_static_file(p)
 
 
 @app.get("/static/inktime/<key>/<screen>/<direction>/preview.png")
 def esp_preview_dir(key: str, screen: str, direction: str):
-    if key != DOWNLOAD_KEY:
-        abort(404)
+    _check_download_key(key)
     p = _screen_direction_path(screen, direction, "preview.png")
     return _send_static_file(p)
 
 
 @app.get("/static/inktime/<key>/<screen>/<direction>/manifest.json")
 def esp_manifest_dir(key: str, screen: str, direction: str):
-    if key != DOWNLOAD_KEY:
-        abort(404)
+    _check_download_key(key)
     p = _screen_direction_path(screen, direction, "manifest.json")
     return _send_static_file(p)
 
