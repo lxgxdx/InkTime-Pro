@@ -67,6 +67,12 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 PROGRESS_FILE = Path(os.environ.get("INKTIME_PROGRESS_FILE", str(LOG_DIR / "scan_progress.json"))).expanduser()
 PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+# 去重进度用【单独一份】文件：扫描与去重是两个互不相干的进程，共用一个文件的话
+# 后写的会把先写的整个覆盖掉，页面上的百分比就会莫名其妙地跳。
+DEDUPE_PROGRESS_FILE = Path(os.environ.get(
+    "INKTIME_DEDUPE_PROGRESS_FILE", str(LOG_DIR / "dedupe_progress.json"))).expanduser()
+DEDUPE_PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
 # ---- Token 感知调度参数（来自 config.py / 设置页 quota 段） ----
 # 这些是 import 时从 cfg 读的快照；设置页保存后经 _refresh_quota_globals() 同步（见该函数）。
 IDLE_WINDOW_START = str(getattr(cfg, "IDLE_WINDOW_START", "23:00") or "23:00")
@@ -333,7 +339,21 @@ class Scheduler:
             "quota": self._quota_status,
             "scan_running": self.is_analyze_running(),
             "render_running": self.is_render_running(),
+            "dedupe_running": self.is_dedupe_running(),
         }
+
+    @staticmethod
+    def _job_env() -> dict:
+        """子进程环境：把两个进度文件路径都注入进去。
+
+        两个都给：扫描读 INKTIME_PROGRESS_FILE，去重读 INKTIME_DEDUPE_PROGRESS_FILE。
+        三个拉起子进程的地方（cron、手动扫描、手动任务）都从这里取，免得像
+        之前那样漏掉一处，去重的进度就静默地永远不写。
+        """
+        env = dict(os.environ)
+        env["INKTIME_PROGRESS_FILE"] = str(PROGRESS_FILE)
+        env["INKTIME_DEDUPE_PROGRESS_FILE"] = str(DEDUPE_PROGRESS_FILE)
+        return env
 
     def _spawn(self, job: dict, now: datetime) -> None:
         """拉起 job 子进程（非阻塞）。analyze 走 token 门控 + 冷却 + batch_limit 注入。"""
@@ -345,8 +365,7 @@ class Scheduler:
             return
 
         cmd = list(job["cmd"])
-        env = dict(os.environ)
-        env["INKTIME_PROGRESS_FILE"] = str(PROGRESS_FILE)
+        env = self._job_env()
 
         if job.get("quota_gated"):
             # token 门控：返回 (ok, batch, reason)，batch 由剩余额度估算
@@ -418,9 +437,8 @@ class Scheduler:
             msg = "已开始【重新扫描】，将重新打分已入库照片（" + msg.replace("已开始扫描，", "")
 
         # 注入估算的批量 + 可选重扫标记
-        env = dict(os.environ)
+        env = self._job_env()
         env["INKTIME_BATCH_LIMIT"] = str(batch)
-        env["INKTIME_PROGRESS_FILE"] = str(PROGRESS_FILE)
         if rescan:
             env["INKTIME_RESCAN"] = "1"
         log_path = LOG_DIR / job["log"]
@@ -465,6 +483,10 @@ class Scheduler:
         p = self._proc.get("render")
         return p is not None and p.poll() is None
 
+    def is_dedupe_running(self) -> bool:
+        p = self._proc.get("dedupe")
+        return p is not None and p.poll() is None
+
     def start_job_manual(self, name: str, extra_args: list[str] | None = None,
                          msg_ok: str = "已开始") -> tuple[bool, str]:
         """手动拉起某个 job（网页按钮用）。
@@ -481,7 +503,7 @@ class Scheduler:
             return False, "该任务正在运行，请稍候"
 
         cmd = list(job["cmd"]) + list(extra_args or [])
-        env = dict(os.environ)
+        env = self._job_env()
         log_path = LOG_DIR / job["log"]
         now = datetime.now()
         shell_cmd = f"{shlex.join(cmd)} 2>&1 | tee -a {shlex.quote(str(log_path))}"
@@ -641,6 +663,18 @@ def _open_db() -> sqlite3.Connection:
         return analyze_photos.open_db(DB_PATH)
     except Exception:
         return sqlite3.connect(DB_PATH, timeout=30.0)
+
+
+def _read_progress_file(path: Path) -> dict:
+    """读一份进度快照。文件不存在、内容坏掉、不是 dict —— 一律返回空 dict。
+
+    进度是增强信息，任何异常都不该让接口 500。
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
 
 
 def _send_static_file(p: Path) -> Response:
@@ -1103,6 +1137,77 @@ def extract_date_from_exif(exif_json: str | None) -> str:
 # HTML builders
 # --------------------------
 
+# 全局后台任务状态条（扫描 / 去重共用一份实现）。
+#
+# 照片库主页有两个版本（空库版与正常版）分别由不同函数返回，这段 JS 原本是各抄
+# 一份的 —— 去重之前没进度，两边抄漏了也没人发现。改成单一来源，插入点用
+# /*__POLL_TASKS__*/ 标记（见 _build_empty_review_html 与 build_html）。
+#
+# 用原始字符串：里面的 JS 正则 /[\\/]/ 要原样落到页面上，普通字符串的转义规则
+# 会让它少一层反斜杠，Windows 路径就切不出文件名了。
+_POLL_TASKS_JS = r"""
+// —— 全局后台任务状态条 ——
+// 扫描和去重哪个在跑就显示哪个（两个同时跑时优先显示扫描）；每 2 秒轮询一次，
+// 从照片库切到别的页再切回来也不会丢。
+function _taskBarRender(el, title, percent, detail){
+  el.style.display = 'block';
+  el.style.background = '#16181d'; el.style.border = '1px solid #2a2e37';
+  el.style.borderRadius = '14px'; el.style.padding = '12px 14px'; el.style.margin = '0 auto 16px';
+  el.style.maxWidth = '560px';
+  el.innerHTML =
+    '<div style="font-size:13px;color:#9cffd6;font-weight:600;margin-bottom:6px">' + title + '</div>' +
+    '<div style="display:flex;align-items:center;gap:10px">' +
+      '<div style="flex:1;height:12px;background:#2a2e37;border-radius:6px;overflow:hidden">' +
+        '<div style="height:100%;width:' + Math.min(100, Math.max(0, percent)) + '%;background:linear-gradient(90deg,#3fb58a,#54d6a4);border-radius:6px"></div>' +
+      '</div>' +
+      '<div style="font-size:12px;color:#8a93a3;width:70px;text-align:right">' + percent + '%</div>' +
+    '</div>' +
+    '<div style="font-size:12px;color:#8a93a3;margin-top:6px">' + detail + '</div>';
+}
+
+function _taskDur(sec){
+  var s = Math.round(sec || 0);
+  if (s < 60) return s + ' 秒';
+  var m = Math.floor(s / 60);
+  if (m < 60) return m + ' 分 ' + (s % 60) + ' 秒';
+  return Math.floor(m / 60) + ' 小时 ' + (m % 60) + ' 分';
+}
+
+function pollGlobalTasks(){
+  var bar = document.getElementById('globalTaskBar');
+  if (!bar) return;
+  fetch('/api/status').then(function(r){ return r.json(); }).then(function(st){
+    if (st.scan_running) {
+      fetch('/api/scan/progress').then(function(r){ return r.json(); }).then(function(p){
+        var pp = (p && p.progress) || {};
+        var cur = pp.current ? String(pp.current).split(/[\\/]/).pop() : '';
+        var amt = (pp.total > 0)
+          ? ('已处理 ' + (pp.done||0) + '/' + pp.total)
+          : ('正在枚举文件，已发现 ' + (pp.done||0) + ' 个');
+        _taskBarRender(bar, '⏳ 后台任务运行中 · 正在扫描照片', pp.percent || 0, amt + (cur ? ' · ' + cur : ''));
+      }).catch(function(){});
+    } else if (st.dedupe_running) {
+      fetch('/api/dedupe/progress').then(function(r){ return r.json(); }).then(function(p){
+        var pp = (p && p.progress) || {};
+        // 进程刚拉起、还没写出第一份进度时 pp 是空的：这时别写"处理中"（等于没说），
+        // 明说"正在启动" —— 大相册光 import + 列目录就要一会儿。
+        var stg = pp.stage ? ('第 ' + pp.stage + '/' + (pp.stages || 4) + ' 步 · ') : '';
+        var who = pp.phase || (pp.stage ? '' : '正在启动，请稍候…');
+        var amt = (pp.total > 0) ? ((pp.done||0) + '/' + pp.total)
+                                 : (pp.done ? ('已发现 ' + pp.done + ' 个文件') : '');
+        var eta = pp.eta ? ('　预计还需 ' + _taskDur(pp.eta)) : '';
+        _taskBarRender(bar, '🔍 后台任务运行中 · 正在重建去重索引', pp.percent || 0,
+                       stg + who + (amt ? '　' + amt : '') + eta);
+      }).catch(function(){});
+    } else {
+      bar.style.display = 'none';
+    }
+  }).catch(function(){});
+  setTimeout(pollGlobalTasks, 2000);
+}
+"""
+
+
 def _build_empty_review_html() -> str:
     """空库时的照片库主页：引导去设置页填密钥 / 直接点扫描，而不是 404。"""
     return """<!DOCTYPE html>
@@ -1151,38 +1256,11 @@ async function startScan(){
   setTimeout(()=>{ location.reload(); }, 15000);   // 15 秒后自动刷新看进度
 }
 
-// —— 全局后台任务状态条 ——
-function pollGlobalTasks(){
-  const bar = document.getElementById('globalTaskBar');
-  if(!bar) return;
-  fetch('/api/status').then(r=>r.json()).then(st=>{
-    const running = !!st.scan_running;
-    if(!running){ bar.style.display='none'; return; }
-    fetch('/api/scan/progress').then(r=>r.json()).then(p=>{
-      const pp=(p&&p.progress)||{};
-      const pct=(pp.percent||0);
-      const cur = pp.current ? String(pp.current).split(/[\\/]/).pop() : '';
-      bar.style.display='block';
-      bar.style.background='#16181d'; bar.style.border='1px solid #2a2e37';
-      bar.style.borderRadius='14px'; bar.style.padding='12px 14px'; bar.style.margin='0 auto 16px';
-      bar.style.maxWidth='560px';
-      bar.innerHTML=
-        '<div style="font-size:13px;color:#9cffd6;font-weight:600;margin-bottom:6px">⏳ 后台任务运行中 · 正在扫描照片</div>'+
-        '<div style="display:flex;align-items:center;gap:10px">'+
-          '<div style="flex:1;height:12px;background:#2a2e37;border-radius:6px;overflow:hidden">'+
-            '<div style="height:100%;width:'+Math.min(100,Math.max(0,pct))+'%;background:linear-gradient(90deg,#3fb58a,#54d6a4);border-radius:6px"></div>'+
-          '</div>'+
-          '<div style="font-size:12px;color:#8a93a3;width:70px;text-align:right">'+pct+'%</div>'+
-        '</div>'+
-        '<div style="font-size:12px;color:#8a93a3;margin-top:6px">已处理 '+(pp.done||0)+'/'+(pp.total||0)+(cur?' · '+cur:'')+'</div>';
-    }).catch(()=>{});
-  }).catch(()=>{});
-  setTimeout(pollGlobalTasks, 2000);
-}
+/*__POLL_TASKS__*/
 pollGlobalTasks();
 </script>
 </body>
-</html>"""
+</html>""".replace("/*__POLL_TASKS__*/", _POLL_TASKS_JS)
 
 
 def build_html(rows, page: int, page_size: int, total_count: int):
@@ -1751,36 +1829,7 @@ def build_html(rows, page: int, page_size: int, total_count: int):
   </script>
 
   <script>
-    // 全局任务轮询：扫描运行时顶部显示进度条，切回页面立即恢复
-    function pollGlobalTasks(){{
-      const bar = document.getElementById('globalTaskBar');
-      if (!bar) return;
-      fetch('/api/status').then(r => r.json()).then(st => {{
-        const running = !!st.scan_running;
-        if (!running) {{ bar.style.display = 'none'; return; }}
-        fetch('/api/scan/progress').then(r => r.json()).then(p => {{
-          const pp = (p && p.progress) || {{}};
-          const pct = (pp.percent || 0);
-          const cur = pp.current ? String(pp.current).split(/[\\\\/]/).pop() : '';
-          bar.style.display = 'block';
-          bar.innerHTML =
-            '<div style="font-size:13px;color:#9cffd6;font-weight:600;margin-bottom:6px">⏳ 后台任务运行中 · 正在扫描照片</div>' +
-            '<div style="display:flex;align-items:center;gap:10px">' +
-              '<div style="flex:1;height:12px;background:#2a2e37;border-radius:6px;overflow:hidden">' +
-                '<div style="height:100%;width:' + Math.min(100, Math.max(0, pct)) + '%;background:linear-gradient(90deg,#3fb58a,#54d6a4);border-radius:6px"></div>' +
-              '</div>' +
-              '<div style="font-size:12px;color:#8a93a3;width:70px;text-align:right">' + pct + '%</div>' +
-            '</div>' +
-            '<div style="font-size:12px;color:#8a93a3;margin-top:6px">已处理 ' + (pp.done||0) + '/' + (pp.total||0) + (cur ? ' · ' + cur : '') + '</div>';
-          bar.style.background = '#16181d';
-          bar.style.border = '1px solid #2a2e37';
-          bar.style.borderRadius = '14px';
-          bar.style.padding = '12px 14px';
-          bar.style.margin = '0 0 16px';
-        }}).catch(()=>{{}});
-      }}).catch(()=>{{}});
-      setTimeout(pollGlobalTasks, 2000);
-    }}
+{_POLL_TASKS_JS}
 
     // 列表滚动位置记忆：点进模拟器再返回时，回到原来的位置。
     // 只按「路径+查询串」匹配，所以翻页/换筛选后不会错误地跳到别处。
@@ -2954,13 +3003,29 @@ def api_scan_progress():
     _require_webui_enabled()
     running = scheduler.is_analyze_running()
     data: dict = {"running": bool(running)}
-    if PROGRESS_FILE.exists():
-        try:
-            raw = json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                data["progress"] = raw
-        except Exception:
-            pass
+    snap = _read_progress_file(PROGRESS_FILE)
+    if snap:
+        data["progress"] = snap
+    return Response(json.dumps(data, ensure_ascii=False), mimetype="application/json")
+
+
+@app.get("/api/dedupe/progress")
+def api_dedupe_progress():
+    """去重进度 + 上一次的结果。
+
+    running 以【进程状态】为准，文件里的 status 只说明上一次跑到哪：
+    进程没了、文件却还停在 status="running"，那就是中途被中断或崩了 ——
+    如实标成 interrupted，而不是傻等一个永远不会更新的百分比。
+    跑完的那份快照会一直留着（analyze 结束时不删），页面据此显示上次的统计。
+    """
+    _require_webui_enabled()
+    running = scheduler.is_dedupe_running()
+    data: dict = {"running": bool(running)}
+    snap = _read_progress_file(DEDUPE_PROGRESS_FILE)
+    if snap:
+        if not running and snap.get("status") == "running":
+            snap["interrupted"] = True
+        data["progress"] = snap
     return Response(json.dumps(data, ensure_ascii=False), mimetype="application/json")
 
 
@@ -3153,7 +3218,12 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 <div class="kv"><label>选片排除天数</label><input type="text" id="cfg_recent_days" placeholder="30"></div>
 <div class="hint">▲ 每天出图时跳过最近这么多天内已经上过屏的照片，避免连着几天推同一批。</div>
 <div class="kv"><label>去重索引</label><span style="grid-column:2/-1"><button type="button" onclick="rebuildDedupe()">🔍 立即重建去重索引</button></span></div>
-<div class="q-note" id="dedupe_note">首次全量重建要读遍相册里的每个文件，大相册可能要几十分钟；之后是增量，很快。</div>
+<div class="q-note" id="dedupe_note" style="display:none"></div>
+<div class="q-note" style="opacity:.7">首次全量重建要读遍相册里的每个文件，大相册可能要几十分钟；之后是增量，很快。</div>
+<div id="dedupeProgressBox" style="display:none;margin:10px 0;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;">
+  <div class="quota-row"><span class="q-label" id="dedupeStage">准备中…</span><div class="bar"><div class="bar-fill" id="dedupeFill" style="width:0%"></div></div><span class="q-pct" id="dedupePct">0%</span></div>
+  <div class="q-note" id="dedupeDetail"></div>
+</div>
 </details>
 
 <details class="fold">
@@ -3487,14 +3557,83 @@ async function doNext(){
     note.textContent = '换一张失败：' + e;
   }
 }
-async function rebuildDedupe(){
+// 去重索引：点按钮后每 2 秒轮询进度，跑完显示统计。
+// 进度文件在跑完后【不删】，所以隔天再打开这一页，仍能看到上次重建的结果。
+let _dedupeTimer = null;
+const DEDUPE_STAGE_ZH = {1:'读取拍摄信息', 2:'比对文件内容', 3:'划定候选范围', 4:'比对感知哈希'};
+
+function fmtDur(sec){
+  const s = Math.round(sec || 0);
+  if(s < 60) return s + ' 秒';
+  const m = Math.floor(s / 60);
+  if(m < 60) return m + ' 分 ' + (s % 60) + ' 秒';
+  return Math.floor(m / 60) + ' 小时 ' + (m % 60) + ' 分';
+}
+
+// 状态行默认藏着（没话说时不留空行）；一旦有内容就显出来
+function _dedupeSay(text){
   const note = document.getElementById('dedupe_note');
-  note.textContent = '正在启动去重索引…';
+  if(!note) return;
+  note.textContent = text;
+  note.style.display = text ? 'block' : 'none';
+}
+
+async function refreshDedupeProgress(){
+  const box = document.getElementById('dedupeProgressBox');
+  const note = document.getElementById('dedupe_note');
+  if(!box || !note) return;
+  let r;
+  try{ r = await getJSON('/api/dedupe/progress'); }catch(e){ return; }
+  const p = (r && r.progress) || null;
+
+  if(r && r.running && p){
+    box.style.display = 'block';
+    // 优先用后端给的 phase：第 1 步其实含"枚举目录"和"读拍摄信息"两小段，
+    // 写死成阶段名的话，明明还在数文件却显示"读取拍摄信息"，是误导。
+    const name = p.phase || DEDUPE_STAGE_ZH[p.stage] || '处理中';
+    document.getElementById('dedupeStage').textContent =
+      '第 ' + (p.stage || 1) + '/' + (p.stages || 4) + ' 步 · ' + name;
+    document.getElementById('dedupePct').textContent = (p.percent || 0) + '%';
+    document.getElementById('dedupeFill').style.width = Math.min(100, Math.max(0, p.percent || 0)) + '%';
+    let d = (p.total > 0) ? ((p.done || 0) + ' / ' + p.total)
+                          : (p.done > 0 ? ('已发现 ' + p.done + ' 个文件') : '');
+    if(p.elapsed) d += (d ? '　' : '') + '已用时 ' + fmtDur(p.elapsed);
+    if(p.eta) d += '　预计还需 ' + fmtDur(p.eta);
+    document.getElementById('dedupeDetail').textContent = d;
+    if(!_dedupeTimer) _dedupeTimer = setInterval(refreshDedupeProgress, 2000);
+    return;
+  }
+
+  box.style.display = 'none';
+  if(_dedupeTimer){ clearInterval(_dedupeTimer); _dedupeTimer = null; }
+
+  if(p && p.status === 'done'){
+    const s = p.stats || {};
+    const when = p.finished_at ? new Date(p.finished_at).toLocaleString('zh-CN') : '';
+    _dedupeSay('✅ 上次重建' + (when ? '（' + when + '）' : '') + '：共索引 ' + (s.indexed || 0)
+      + ' 张、用时 ' + fmtDur(p.elapsed) + '；标记重复 ' + (s.duplicates || 0)
+      + ' 张（内容相同 ' + (s.exact || 0) + '、连拍 ' + (s.burst || 0)
+      + '、视觉相似 ' + (s.similar || 0) + '）');
+  } else if(p && p.interrupted){
+    _dedupeSay('⚠ 上次重建没有跑完（进程已退出，详见 logs/dedupe.log），索引可能不完整，建议重跑一次。');
+  } else {
+    _dedupeSay('');
+  }
+}
+
+async function rebuildDedupe(){
+  _dedupeSay('正在启动去重索引…');
   try{
     const r = await getJSON('/api/dedupe/start', {method:'POST'});
-    note.textContent = r.msg || (r.ok ? '已开始' : '失败');
+    _dedupeSay(r.msg || (r.ok ? '已开始' : '失败'));
+    if(r.ok){
+      // 先显示进度框，再等子进程写出第一份进度（它要先列一遍目录）
+      const box = document.getElementById('dedupeProgressBox');
+      if(box) box.style.display = 'block';
+      setTimeout(refreshDedupeProgress, 800);
+    }
   }catch(e){
-    note.textContent = '启动失败：' + e;
+    _dedupeSay('启动失败：' + e);
   }
 }
 
@@ -3546,7 +3685,12 @@ async function refreshScanProgress(running){
       if(fill) fill.style.width = Math.min(100, Math.max(0, p.percent||0)) + '%';
       if(pct) pct.textContent = (p.percent||0) + '%';
       if(note){
-        note.textContent = '已处理 ' + (p.done||0) + '/' + (p.total||0) + (p.current ? '　正在：'+basename(p.current) : '');
+        // 列目录阶段还没有可用于算百分比的总数（total=0），这时报"已发现 N 个"
+        // 比"已处理 500/0"更说得通
+        const amt = (p.total > 0)
+          ? ('已处理 ' + (p.done||0) + '/' + p.total)
+          : ('正在枚举文件，已发现 ' + (p.done||0) + ' 个');
+        note.textContent = amt + (p.current ? '　正在：'+basename(p.current) : '');
       }
     }
   }catch(e){ /* 轮询失败静默 */ }
@@ -3593,6 +3737,9 @@ async function stopScan(){
 }
 
 initSettings();
+// 去重进度独立于扫描，不在 initSettings 里：进页面就查一次，
+// 正在跑就接上轮询，跑完了就把上次结果摆出来。
+refreshDedupeProgress();
 </script>
 </div>
 </body>

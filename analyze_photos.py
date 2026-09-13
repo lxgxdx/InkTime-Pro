@@ -29,11 +29,31 @@ from converter import (
 
 
 # =======================
-# 扫描进度上报（供 Web 页面轮询显示）
+# 任务进度上报（供 Web 页面轮询显示）
 # =======================
-# 进度文件路径：server 拉起 analyze 时通过环境变量 INKTIME_PROGRESS_FILE 注入。
-# analyze 每处理一张就把进度写成 JSON，server /api/scan/progress 读它返回给前端。
+# 进度文件路径由 server 拉起子进程时用环境变量注入（命令行直接跑则留空，静默跳过）。
+# 扫描与去重各写各的文件 —— 共用一份的话，去重跑到一半会被扫描的进度覆盖掉，
+# 页面上的百分比就会莫名其妙地跳。
 SCAN_PROGRESS_FILE = os.environ.get("INKTIME_PROGRESS_FILE", "")
+DEDUPE_PROGRESS_FILE = os.environ.get("INKTIME_DEDUPE_PROGRESS_FILE", "")
+
+# 去重起始时刻（main 的去重分支设置），用来在进度里带上已用时与预计剩余。
+_DEDUPE_T0: float = 0.0
+
+
+def _write_progress(path_str: str, payload: dict) -> None:
+    """把一份进度快照覆盖写到指定文件（读到的总是最新状态）。
+
+    失败静默——进度上报只是增强，绝不影响任务主体。
+    """
+    if not path_str:
+        return  # 未注入进度文件路径（比如命令行直接跑），跳过
+    try:
+        path = Path(path_str)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def report_scan_progress(
@@ -43,27 +63,62 @@ def report_scan_progress(
     current: str = "",
     detail: str = "",
 ) -> None:
-    """把当前扫描进度写入进度文件（单次 json 覆盖写，读到的是最新快照）。
+    """扫描进度：每处理一张报一次。"""
+    pct = (done / total) if total > 0 else 0.0
+    _write_progress(SCAN_PROGRESS_FILE, {
+        "done": done,
+        "total": total,
+        "percent": round(100.0 * pct, 1),
+        "phase": phase,
+        "current": current,
+        "detail": detail,
+    })
 
-    失败静默——进度上报只是增强，绝不影响扫描主体。
+
+def report_dedupe_progress(
+    done: int,
+    total: int,
+    phase: str = "",
+    *,
+    stage: int = 0,
+    stages: int = 4,
+    status: str = "running",
+    extra: dict | None = None,
+) -> None:
+    """去重进度。
+
+    percent 是【当前这一层】的完成度，不是整个任务的。去重四层各自的总量差着
+    几个数量级（列目录要过 8000 个文件，感知哈希往往只剩几十张），硬折算成一个
+    总百分比只会得到假的精确度 —— 条走到 80% 不代表快完了。所以另给
+    stage/stages，由页面显示「第 2/4 步 比对文件内容」，把"走到哪了"交给步数说。
+
+    status="done" 时连同统计一起写进同一份文件，页面据此显示上次结果 ——
+    所以结束时【不清】这个文件，否则跑完那一刻的信息就永远看不到了。
     """
-    if not SCAN_PROGRESS_FILE:
-        return  # 未注入进度文件路径（比如命令行直接跑），跳过
-    try:
-        pct = (done / total) if total > 0 else 0.0
-        payload = {
-            "done": done,
-            "total": total,
-            "percent": round(100.0 * pct, 1),
-            "phase": phase,
-            "current": current,
-            "detail": detail,
-        }
-        path = Path(SCAN_PROGRESS_FILE)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    pct = (done / total) if total > 0 else 0.0
+    elapsed = (time.time() - _DEDUPE_T0) if _DEDUPE_T0 else 0.0
+    eta = None
+    if status == "running" and done > 0 and total > done and elapsed > 3:
+        eta = elapsed / done * (total - done)
+        # 不足 1 秒的一律不报 —— 否则页面上会写"预计还需 0 秒"，既没信息量又显得卡住了
+        if eta < 1.0:
+            eta = None
+    payload = {
+        "done": done,
+        "total": total,
+        "percent": round(100.0 * pct, 1),
+        "phase": phase,
+        "current": "",
+        "detail": "",
+        "stage": stage,
+        "stages": stages,
+        "status": status,
+        "elapsed": round(elapsed, 1),
+        "eta": round(eta, 1) if eta else None,
+    }
+    if extra:
+        payload.update(extra)
+    _write_progress(DEDUPE_PROGRESS_FILE, payload)
 
 
 def clear_scan_progress() -> None:
@@ -558,9 +613,12 @@ def generate_side_caption(image_path: Path) -> str | None:
     return caption or None
 
 
-def list_images(limit: int | None = None) -> list[Path]:
+def list_images(limit: int | None = None, progress_cb=None) -> list[Path]:
     # 支持常见 RAW 相机格式（.dng/.cr2/.nef/.arw/.orf/.raf/.rw2/.pef 等）。
     # RAW 解码依赖 rawpy（LibRaw）；未安装时仅提示，不影响 JPG/PNG/HEIC 常规照片。
+    #
+    # progress_cb(scanned)：每 500 个文件回调一次。相册在 NAS 上时 rglob 本身
+    # 就可能跑几分钟，没有这个回调，用户点了按钮会以为程序没反应。
     exts = {
         ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic", ".heif",   # 常规
         ".dng", ".cr2", ".nef", ".arw", ".orf", ".raf", ".rw2", ".pef",  # RAW
@@ -572,6 +630,11 @@ def list_images(limit: int | None = None) -> list[Path]:
         scanned += 1
         if scanned % 500 == 0:
             print(f"[SCAN] 已扫描文件数：{scanned} …")
+            if progress_cb:
+                try:
+                    progress_cb(scanned)
+                except Exception:
+                    pass
         if p.is_file() and p.suffix.lower() in exts:
             if is_ignored(p):
                 continue
@@ -820,10 +883,23 @@ def run_dedupe(conn: sqlite3.Connection, paths: list, *,
 
     保留规则（确定性）：已打过分的胜出，否则路径字典序最小者胜。确定性很关键 ——
     否则每轮跑出来的 dup_of 会翻转，用户会觉得"重复对象"变来变去。
+
+    progress_cb(done, total, phase, stage, stages)：逐层上报进度。四层各自的总量
+    相差极大，所以 done/total 说的都是【当前层】的进度，stage 才是"走到第几步"。
     """
     ensure_hash_table(conn)
     cur = conn.cursor()
     now_iso = dt.datetime.now().isoformat(timespec="seconds")
+
+    # 关掉视觉校验时第 ④ 层不跑，步数就该少一步，别让页面显示"第 3/4 步"然后直接结束
+    stages = 4 if enable_similar else 3
+
+    def _cb(stage: int, done: int, total: int, phase: str) -> None:
+        if progress_cb:
+            try:
+                progress_cb(done, total, phase, stage, stages)
+            except Exception:
+                pass          # 进度上报失败不该拖垮判重本身
 
     # ---- 载入既有索引 ----
     known = {}
@@ -833,23 +909,26 @@ def run_dedupe(conn: sqlite3.Connection, paths: list, *,
                        "dt": _parse_exif_dt(r[4]), "_dt_raw": r[4],
                        "make": r[5], "model": r[6]}
 
-    # ---- 一次 stat 拿全部文件大小（远比逐个 Image.open 便宜）----
+    # ---- ① 一次 stat 拿全部文件大小（远比逐个 Image.open 便宜）+ 读 EXIF ----
+    # 进度按【走过的文件数】报，不按【真正需要重读的文件数】报：增量跑时后者
+    # 常常是 0（全都有索引了），按它报进度就永远停在 0%，看着像卡死。
     info = {}
     todo = 0
-    for p in paths:
+    n_paths = len(paths)
+    for i, p in enumerate(paths, 1):
         sp = str(p)
         sz = _file_size(p)
         old = known.get(sp)
         if old and not reindex and old["size"] == sz and sz is not None:
             info[sp] = dict(old)
-            continue
-        todo += 1
-        ex_dt, ex_make, ex_model = _read_exif_light(p)
-        info[sp] = {"size": sz, "sha1": None, "dhash": None, "dt": ex_dt,
-                    "_dt_raw": ex_dt.isoformat() if ex_dt else None,
-                    "make": ex_make, "model": ex_model}
-        if progress_cb and todo % 200 == 0:
-            progress_cb(todo, len(paths), "读取 EXIF")
+        else:
+            todo += 1
+            ex_dt, ex_make, ex_model = _read_exif_light(p)
+            info[sp] = {"size": sz, "sha1": None, "dhash": None, "dt": ex_dt,
+                        "_dt_raw": ex_dt.isoformat() if ex_dt else None,
+                        "make": ex_make, "model": ex_model}
+        if i % 200 == 0 or i == n_paths:
+            _cb(1, i, n_paths, "读取拍摄信息")
 
     # ---- union-find（代表取字典序最小，保证结果稳定）----
     parent: dict[str, str] = {}
@@ -878,12 +957,20 @@ def run_dedupe(conn: sqlite3.Connection, paths: list, *,
         if meta["size"] is not None:
             by_size.setdefault(meta["size"], []).append(sp)
 
+    # 只有"至少两张文件大小相同"的才值得算内容哈希，先数出总量好报进度
+    sha_todo = sum(1 for g in by_size.values() if len(g) >= 2
+                   for sp in g if info[sp]["sha1"] is None)
+    _cb(2, 0, sha_todo, "比对文件内容")
+    sha_done = 0
     for size, group in by_size.items():
         if len(group) < 2:
             continue
         for sp in group:
             if info[sp]["sha1"] is None:
                 info[sp]["sha1"] = _sha1_file(Path(sp))
+                sha_done += 1
+                if sha_done % 50 == 0 or sha_done == sha_todo:
+                    _cb(2, sha_done, sha_todo, "比对文件内容")
         by_sha: dict[str, list] = {}
         for sp in group:
             if info[sp]["sha1"]:
@@ -901,6 +988,7 @@ def run_dedupe(conn: sqlite3.Connection, paths: list, *,
     # 光按时间判重会误杀：扫街时连拍十张构图各不相同，时间都在几秒内，一刀切会把
     # 其中九张当重复丢掉 —— 那是真的丢内容。所以时间只用来【缩小候选范围】，
     # 是否真的重复一律交给 ④ 的 dHash 确认。
+    _cb(3, 0, 1, "划定候选范围")
     burst_clusters: list[list] = []
     if enable_burst:
         by_cam: dict[tuple, list] = {}
@@ -934,6 +1022,27 @@ def run_dedupe(conn: sqlite3.Connection, paths: list, *,
         for group in by_day.values():
             if len(group) >= 2:
                 suspect_sets.append((group, "similar"))
+    _cb(3, 1, 1, "划定候选范围")
+
+    # 第 ④ 层有两段工作量：先给嫌疑照片算 dHash（开文件解码，慢），再把组内两两比对
+    # （纯 CPU，但组一大就是平方级）。两段合起来报一个进度 —— 只报前一段的话，
+    # 大组里漫长的比对会让进度条死死停在 100%，看着像是卡死了。
+    dh_todo, _seen_dh = 0, set()
+    pairs_total = 0
+    if enable_similar:
+        for group, _k in suspect_sets:
+            pairs_total += len(group) * (len(group) - 1) // 2
+            for sp in group:
+                if info[sp]["dhash"] is None and sp not in _seen_dh:
+                    _seen_dh.add(sp)
+                    dh_todo += 1
+    unit_total = dh_todo + pairs_total
+    unit_done = 0
+    # 至多写 200 份进度：两两比对可能上百万次，每次都写文件就成了瓶颈
+    _unit_tick = max(1, unit_total // 200)
+    _unit_next = _unit_tick
+    if enable_similar:
+        _cb(4, 0, unit_total, "比对感知哈希")
 
     for group, kind in suspect_sets:
         if not enable_similar:
@@ -948,8 +1057,16 @@ def run_dedupe(conn: sqlite3.Connection, paths: list, *,
         for sp in group:
             if info[sp]["dhash"] is None:
                 info[sp]["dhash"] = _dhash(Path(sp))
+                unit_done += 1
+                if unit_done >= _unit_next:
+                    _unit_next = unit_done + _unit_tick
+                    _cb(4, unit_done, unit_total, "比对感知哈希")
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
+                unit_done += 1
+                if unit_done >= _unit_next:
+                    _unit_next = unit_done + _unit_tick
+                    _cb(4, unit_done, unit_total, "比对感知哈希")
                 a, b = group[i], group[j]
                 da, db_ = info[a]["dhash"], info[b]["dhash"]
                 if not da or not db_:
@@ -958,6 +1075,8 @@ def run_dedupe(conn: sqlite3.Connection, paths: list, *,
                     union(a, b)
                     kinds.setdefault(b, kind)
                     stats[kind] += 1
+    if enable_similar and unit_done != unit_total:
+        _cb(4, unit_total, unit_total, "比对感知哈希")
 
     # ---- 汇总：每组选一个保留者 ----
     groups: dict[str, list] = {}
@@ -2000,6 +2119,26 @@ def main():
         print("[WARN] --cache 仅建议用于调试提速，不适合生产环境。")
         print("[WARN] 使用缓存会跳过目录重扫：新增照片不会被发现，已删除照片的旧记录也可能保留在数据库中。")
 
+    # 去重的计时从"列目录之前"就开始：rglob 整个相册本身就要跑一阵子，
+    # 把这部分排除在外，页面上的"已用时"会比用户实际等的时间短一截。
+    _dd_stages = 4 if bool(getattr(cfg, "DEDUPE_SIMILAR_ENABLED", True)) else 3
+    if args.dedupe_only:
+        global _DEDUPE_T0
+        _DEDUPE_T0 = time.time()
+        report_dedupe_progress(0, 0, "正在枚举照片文件", stage=1, stages=_dd_stages)
+
+    _listed = {"reported": False}
+
+    def _list_progress(scanned: int) -> None:
+        # 列目录不在下面任何一层的统计里，单独报，否则点了按钮会长时间毫无动静
+        _listed["reported"] = True
+        if args.dedupe_only:
+            report_dedupe_progress(scanned, 0, "正在枚举照片文件",
+                                   stage=1, stages=_dd_stages)
+        else:
+            report_scan_progress(scanned, 0, phase="list",
+                                 detail=f"正在枚举文件，已发现 {scanned} 个")
+
     if args.cache and cache_path.exists():
         print(f"[INFO] 读取缓存文件列表：{cache_path}")
         cached = cache_path.read_text(encoding="utf-8").strip().splitlines()
@@ -2007,7 +2146,7 @@ def main():
         print(f"[INFO] 从缓存加载 {len(imgs)} 个文件。")
     else:
         print("[INFO] 正在扫描图片目录……")
-        imgs = list_images()
+        imgs = list_images(progress_cb=_list_progress)
         if args.cache:
             cache_path.write_text("\n".join(str(p) for p in imgs), encoding="utf-8")
             print(f"[INFO] 已写入缓存文件：{cache_path}")
@@ -2102,12 +2241,17 @@ def main():
         if freed:
             print(f"[INFO] 已释放 {freed} 条失效的重复标记（其保留者已删除或已失效）")
         print(f"[INFO] 开始建立去重索引，共 {len(imgs)} 张……")
-        report_scan_progress(0, len(imgs), phase="dedupe", current="", detail="建立去重索引")
+        # 枚举阶段已经报过进度的话就别再补一份 0/N —— 那会让进度条从
+        # "已发现 7500 个文件" 突然跌回 0%，看着像出错了。只有相册很小、
+        # 枚举快到没触发回调时，才需要这一份来让页面立刻有东西显示。
+        if not _listed["reported"]:
+            report_dedupe_progress(0, len(imgs), "准备读取拍摄信息",
+                                   stage=1, stages=_dd_stages)
         t_dedupe = time.time()
 
-        def _dedupe_progress(done: int, total_: int, phase: str) -> None:
-            report_scan_progress(done, total_, phase="dedupe", current="",
-                                 detail=f"{phase} {done}/{total_}")
+        def _dedupe_progress(done: int, total_: int, phase: str,
+                             stage: int, stages: int) -> None:
+            report_dedupe_progress(done, total_, phase, stage=stage, stages=stages)
 
         stats = run_dedupe(
             conn, imgs,
@@ -2122,8 +2266,20 @@ def main():
               f"本次新算 {stats['newly_indexed']} 张 / 共索引 {stats['indexed']} 张 / "
               f"标记重复 {stats['duplicates']} 张 "
               f"（内容相同 {stats['exact']}、连拍 {stats['burst']}、视觉相似 {stats['similar']}）")
+        # 收尾写一份 status=done 的快照（带统计），页面据此显示"上次重建的结果"。
+        # 这里刻意【不】清进度文件 —— 清掉的话，跑完那一刻的信息就再也看不到了，
+        # 而用户多半是过一阵子才回来看结果的。
+        report_dedupe_progress(
+            len(imgs), len(imgs), "已完成", stage=_dd_stages, stages=_dd_stages,
+            status="done",
+            extra={
+                "finished_at": dt.datetime.now().isoformat(timespec="seconds"),
+                "stats": {k: int(stats.get(k) or 0) for k in
+                          ("indexed", "newly_indexed", "duplicates",
+                           "exact", "burst", "similar")},
+            },
+        )
         conn.close()
-        clear_scan_progress()
         return
 
     # 重新扫描：跳过 filter_unscored，全量重扫（含已入库）；否则只扫未入库的新照片
