@@ -101,9 +101,73 @@ git pull && docker compose up -d --build
 
 ## 与 ESP32 固件衔接
 
-- 固件下载地址 = `http://<NAS_IP>:8765/static/inktime/<DOWNLOAD_KEY>/latest.bin`
-  （`DOWNLOAD_KEY` 在 `config.py`，改后需同步改固件的 `DAILY_PHOTO_PATH_PREFIX`）
+固件源码在 [`firmware/`](firmware/)（PlatformIO 工程，编译/烧录/配网步骤见那里的 README）。
+
+### 固件要的下载地址
+
+```
+GET /static/inktime/<DOWNLOAD_KEY>/<屏名>/<方向>/manifest.json
+GET /static/inktime/<DOWNLOAD_KEY>/<屏名>/<方向>/photo_<n>.bin
+```
+
+- `<屏名>` = `SCREENS[].name`，如 `GDEP073E01`
+- `<方向>` 只有 `portrait`（480×800）和 `landscape`（800×480）两种。
+  正方形照片归入 `portrait`，**不存在第三种值**（曾经有个 `square` 值，
+  下载路由的方向白名单不认它，设备永远 404）
+- `manifest.json` 字段：
+
+  | 字段 | 含义 |
+  |---|---|
+  | `screen` / `orientation` | 屏名 / 方向 |
+  | `canvas.{width,height}` | 该方向的画布尺寸（横图会对调） |
+  | `bin_format` / `palette_size` | `1byte_per_px`，6 |
+  | `count` | **该方向实际的张数**（不保证等于 `DAILY_PHOTO_QUANTITY`） |
+  | `latest` | 恒为 `photo_0.bin` |
+  | `generated_at` | 本次渲染时间戳。相框「换一张」后靠它判断新图是否真的出来了 |
+  | `battery_slot.{x,y,w,h}` | 右下角留给相框画电量图标的**白底区坐标** |
+  | `photos[]` | 每张的 `rel` / `path` / `date` / `side` / `memory` |
+
+- **`count` 不保证是 5**，序号 `0..count-1` 连续无空洞；某个方向的目录
+  **可能整个不存在**（那天该方向一张都没选中）。所以固件不能硬编码 `photo_0..4`。
+- 相框的路径前缀只用到 `<屏名>/<方向>/` 这两段；`DOWNLOAD_KEY` 在 `config.py`，
+  改后要同步改固件配网页里的「下载密钥」。
 - 端口 8765 已在 compose 里映射；ESP32 能访问 NAS 该端口即可。
+
+### 电量图标（`battery_slot`）
+
+相框要在屏幕上画一个电量图标（充满绿、低于 20% 变红），位置在右下角。
+但底部第二行是「日期左对齐 + 地点右对齐」，**右下角本来被地点文字占着**，
+所以服务器渲染时会：
+
+1. 把地点文字右端往左让出 `BATTERY_SLOT_W + GAP`；
+2. 把这块白底区的坐标写进 `manifest.json` 的 `battery_slot`。
+
+固件照着这个坐标画，**不硬编码位置** —— 以后改版式只要动服务器，固件不用重编。
+槽的尺寸固定 72×30、不随方向缩放，因为固件那边用的是固定尺寸的点阵字模。
+
+> 相关的两个函数在 `render_daily_photo.py`：`_text_band_metrics()`（文字两行的 y，
+> 渲染和定位都调它）和 `_battery_slot()`。
+
+### 设备状态上报
+
+```
+POST /api/device/report     {"soc":82,"voltage":4.01,"rssi":-58,"charging":true,
+                             "full":false,"orientation":"portrait","fw":"v0.1.0"}
+```
+
+设置页「相框设备」那张卡片会显示。**不报也一切照常**，只是那几行是空的。
+另有 `POST /api/next`（换一张，异步重渲染）和 `GET /api/device`（读状态）。
+
+### 顶层兼容路径（旧固件用，新固件别用）
+
+```
+GET /static/inktime/<DOWNLOAD_KEY>/latest.bin
+GET /static/inktime/<DOWNLOAD_KEY>/photo_<n>.bin
+```
+
+`latest.bin` 是「默认屏 + portrait 优先」的副本，仍然新鲜；但**顶层
+`photo_<n>.bin` 已经没有任何代码会写了**，磁盘上若还有那是历史遗留文件，
+拉到的会是陈旧内容。
 
 ## 说明（重要）
 

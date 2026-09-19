@@ -3064,6 +3064,68 @@ def api_device():
     return Response(json.dumps(st, ensure_ascii=False), mimetype="application/json")
 
 
+def _clamp_int(v, lo: int, hi: int):
+    """把上报值收敛成范围内的整数，收不了就返回 None（宁可空着也别写脏数据）。"""
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    return max(lo, min(hi, n))
+
+
+@app.post("/api/device/report")
+def api_device_report():
+    """相框主动上报自身状态（电量 / 电压 / 信号 / 固件版本 / 当前方向 / 是否在充电）。
+
+    和下载路由那条被动记录是两回事：那里只知道"谁在什么时候拉了哪个文件"，
+    这里才有设备自身的状态。固件不来报也一切照常，只是设置页少了这几行。
+
+    没有鉴权 —— 局域网内、写的又都是非敏感信息。但正因为无鉴权，所有字段都要
+    做类型收敛和范围钳制，别让一个坏包把 device_state.json 写成垃圾。
+    """
+    _require_webui_enabled()
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        body = {}
+
+    soc = _clamp_int(body.get("soc"), 0, 100)
+    rssi = _clamp_int(body.get("rssi"), -127, 0)
+    orientation = str(body.get("orientation") or "").strip().lower()
+    if orientation not in ("portrait", "landscape"):
+        orientation = ""
+    fw = str(body.get("fw") or "").strip()[:32]
+
+    try:
+        voltage = round(float(body.get("voltage")), 3)
+        if not (0.0 < voltage < 10.0):
+            voltage = None
+    except (TypeError, ValueError):
+        voltage = None
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    ip = request.remote_addr or ""
+    with _DEVICE_LOCK:
+        st = _load_device_state()
+        st["report"] = {
+            "at": now_iso,
+            "soc": soc,
+            "voltage": voltage,
+            "rssi": rssi,
+            "charging": bool(body.get("charging")),
+            "full": bool(body.get("full")),
+            "orientation": orientation,
+            "fw": fw,
+            "ip": ip,
+        }
+        st["last_seen_at"] = now_iso
+        st["last_ip"] = ip
+        # 上报是一天几次的低频事件，不受 _touch_device 那套 10 秒节流，直接落盘
+        _write_device_state(st)
+
+    return Response(json.dumps({"ok": True}, ensure_ascii=False),
+                    mimetype="application/json")
+
+
 @app.get("/api/scan/progress")
 def api_scan_progress():
     """返回扫描实时进度（analyze 写到 PROGRESS_FILE 的 JSON）。未在扫描则返回 running=false。"""
@@ -3262,11 +3324,14 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 
 <details class="fold">
 <summary>相框设备（最后上线 / 换一张）</summary>
-<div class="hint">数据来自相框每次拉取图片时的被动记录，固件不需要任何改动。还没有设备接入时这里会是空的。</div>
+<div class="hint">「最后上线 / 最后拉取 / 累计拉取」来自相框拉图时的被动记录，固件不用做任何事就有；「电量 / 信号」要固件主动上报（InkTime 相框固件已内置），没上报过就是空的。</div>
 <div class="kv"><label>最后上线</label><span id="dev_last_seen" style="grid-column:2/-1">—</span></div>
 <div class="kv"><label>最后拉取</label><span id="dev_last_file" style="grid-column:2/-1">—</span></div>
 <div class="kv"><label>设备地址</label><span id="dev_last_ip" style="grid-column:2/-1">—</span></div>
 <div class="kv"><label>累计拉取</label><span id="dev_pull_count" style="grid-column:2/-1">—</span></div>
+<div class="kv"><label>电量</label><span id="dev_battery" style="grid-column:2/-1">—</span></div>
+<div class="kv"><label>信号</label><span id="dev_rssi" style="grid-column:2/-1">—</span></div>
+<div class="kv"><label>固件</label><span id="dev_fw" style="grid-column:2/-1">—</span></div>
 <div class="kv"><label>操作</label><span style="grid-column:2/-1;display:flex;gap:8px;flex-wrap:wrap">
 <button type="button" onclick="doNext()">🔀 换一张</button>
 <button type="button" onclick="refreshDevice()">刷新状态</button>
@@ -3632,6 +3697,26 @@ async function refreshDevice(){
     document.getElementById('dev_last_file').textContent = k ? (k + ' → ' + bt[k].last_file) : '—';
     document.getElementById('dev_last_ip').textContent = d.last_ip || '—';
     document.getElementById('dev_pull_count').textContent = (d.pull_count||0) + ' 次';
+
+    // 设备主动上报的状态。固件没上报过时全部留空 —— 拉图功能不受影响。
+    const rep = d.report || {};
+    const batEl = document.getElementById('dev_battery');
+    if(batEl){
+      if(rep.soc === null || rep.soc === undefined){
+        batEl.textContent = '—（相框还没上报过）';
+      }else{
+        const parts = [rep.soc + '%'];
+        if(rep.voltage != null) parts.push(rep.voltage.toFixed(2) + ' V');
+        if(rep.charging) parts.push('⚡ 充电中');
+        else if(rep.full) parts.push('已充满');
+        if(rep.orientation) parts.push(rep.orientation === 'landscape' ? '横放' : '竖放');
+        if(rep.at) parts.push(agoText(rep.at));
+        batEl.textContent = parts.join('　·　');
+      }
+      document.getElementById('dev_rssi').textContent =
+        (rep.rssi === null || rep.rssi === undefined) ? '—' : (rep.rssi + ' dBm');
+      document.getElementById('dev_fw').textContent = rep.fw || '—';
+    }
   }catch(e){
     seenEl.textContent = '读取失败：' + e;
   }

@@ -173,6 +173,53 @@ def _screen_params(screen: dict, orient: Optional[str] = None) -> tuple:
     return canvas_w, canvas_h, ta, pal, bfmt
 
 
+# === 电量图标槽（右下角） ===
+# 相框固件会在屏上画一个电池图标 + 百分比。位置由服务器说了算：渲染时在右下角
+# 留出这块白底，同时把坐标写进 manifest.json 的 battery_slot，固件照着画。
+# 这样以后改版式只要动服务器，固件不用重编。
+#
+# 尺寸固定、不随方向缩放 —— 固件用的是固定尺寸的 5×8 点阵字模，槽跟着画布缩
+# 数字就塞不下了（文字本来也是固定 22/20 号字，不随画布缩放）。
+BATTERY_SLOT_W = 72
+BATTERY_SLOT_H = 30
+BATTERY_SLOT_GAP = 6      # 槽与左侧地点文字之间的缝
+
+
+def _text_band_metrics(cw: int, ch: int, ta: int) -> tuple:
+    """返回 (文字区顶边 y, 第二行 y)。
+
+    render_image() 画文字、_battery_slot() 定位图标槽，两边都调它 ——
+    分成两处各算一遍的话，迟早有一边忘了跟着改（crop 列错位就是这么来的）。
+    """
+    top = ch - ta + max(6, int(round(10 * ch / 800.0)))
+    second = top + max(44, int(round(54 * ch / 800.0)))
+    return top, second
+
+
+def _battery_slot(cw: int, ch: int, ta: int) -> dict:
+    """右下角电量槽的画布坐标。与第二行文字同一条水平带，并夹在画布内。"""
+    pad_x = max(8, int(round(24 * cw / 480.0)))
+    _, second_line_y = _text_band_metrics(cw, ch, ta)
+    # 让槽的竖直中心大致落在 20 号字的视觉中心上
+    y = second_line_y + 10 - BATTERY_SLOT_H // 2
+    y = max(0, min(y, ch - BATTERY_SLOT_H))
+    x = max(0, cw - pad_x - BATTERY_SLOT_W)
+    return {"x": int(x), "y": int(y), "w": BATTERY_SLOT_W, "h": BATTERY_SLOT_H}
+
+
+def _truncate_to_width(draw, text: str, font, max_w: float) -> str:
+    """按像素宽度截断（不按字符数 —— 中英混排下字符数靠不住），截断了补省略号。"""
+    if max_w <= 0 or not text:
+        return ""
+    if draw.textlength(text, font=font) <= max_w:
+        return text
+    ell_w = draw.textlength("…", font=font)
+    out = text
+    while out and draw.textlength(out, font=font) + ell_w > max_w:
+        out = out[:-1]
+    return (out + "…") if out else ""
+
+
 def _palette_idx_map(palette: list) -> dict:
     return {tuple(c): i for i, c in enumerate(palette)}
 
@@ -654,7 +701,7 @@ def render_image(item: Dict[str, Any], screen: Optional[Dict[str, Any]] = None) 
 
     # ---------- 底部文字区域（两种方向都放底部横条） ----------
     padding_x = max(8, int(round(24 * cw / 480.0)))   # 按画布宽等比
-    text_area_top = ch - ta + max(6, int(round(10 * ch / 800.0)))
+    text_area_top, second_line_y = _text_band_metrics(cw, ch, ta)
     text_width = cw - 2 * padding_x
 
     # 字体：FONT_PATH 为空时自动探测容器/本机 CJK 中文字体（否则 load_default 无中文乱码）
@@ -663,25 +710,34 @@ def render_image(item: Dict[str, Any], screen: Optional[Dict[str, Any]] = None) 
 
     side_text = item.get("side") or ""
 
+    # 电量图标槽：固件会在右下角这块留白上画电池图标，文字必须绕开它。
+    # 竖用时槽在文案下方、互不干扰；横用时文字带挤，槽会和文案的行区间重叠，
+    # 那时文案也得一起让开槽宽 —— 否则长文案的第二行会顶到图标上。
+    slot = _battery_slot(cw, ch, ta)
+    line_h = max(18, int(round(24 * ch / 800.0)))
+    side_width = text_width
+    if slot["y"] < text_area_top + 2 * line_h:
+        side_width = max(40, text_width - (BATTERY_SLOT_W + BATTERY_SLOT_GAP))
+
     # 文案：最多两行，从 text_area_top 开始
     y = text_area_top
     if side_text:
-        lines = wrap_text_chinese(draw, side_text, font_big, text_width, max_lines=2)
+        lines = wrap_text_chinese(draw, side_text, font_big, side_width, max_lines=2)
         for line in lines:
             draw.text((padding_x, y), line, font=font_big, fill=(0, 0, 0))
-            y += max(18, int(round(24 * ch / 800.0)))  # 行高等比
+            y += line_h  # 行高等比
 
     # 日期 + 地点：固定在底部区域内的第二行
     date_display = format_date_display(item["date"])
     loc_display = format_location(item.get("lat"), item.get("lon"), item.get("city") or "")
 
-    second_line_y = text_area_top + max(44, int(round(54 * ch / 800.0)))
     draw.text((padding_x, second_line_y), date_display, font=font_small, fill=(0, 0, 0))
 
+    # 地点右对齐，但右端必须让开电量槽（槽区要保持纯白，固件要在上面画图标）
+    loc_right = slot["x"] - BATTERY_SLOT_GAP
+    loc_display = _truncate_to_width(draw, loc_display, font_small, loc_right - padding_x)
     loc_w = draw.textlength(loc_display, font=font_small)
-    loc_x = padding_x + text_width - loc_w
-    if loc_x < padding_x:
-        loc_x = padding_x
+    loc_x = max(padding_x, loc_right - loc_w)
     draw.text((loc_x, second_line_y), loc_display, font=font_small, fill=(0, 0, 0))
 
     return canvas, orient
@@ -1026,7 +1082,7 @@ def main(argv=None):
         # 每方向同步 latest.* 指向该方向 photo_0 + 写 manifest.json
         for orient, entries in dir_manifest.items():
             d = out_root / orient
-            cw, ch, _, _, _ = _screen_params(screen, orient)
+            cw, ch, ta, _, _ = _screen_params(screen, orient)
             first_bin = d / "photo_0.bin"
             first_h = d / "photo_0.h"
             first_preview = d / "preview_0.png"
@@ -1046,6 +1102,13 @@ def main(argv=None):
                 "palette_size": len(spal),
                 "count": len(entries),
                 "latest": "photo_0.bin",
+                # 本次渲染的时间戳。相框按「换一张」之后是异步等结果的：它轮询这个
+                # 字段，变了才说明新图真的出来了（光看 count 不行，重渲染后张数
+                # 常常一样，区分不出来）。
+                "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+                # 右下角留给固件画电量图标的空白区（画布坐标）。固件照这个坐标画，
+                # 不硬编码 —— 版式改了只要动服务器，固件不用重编。
+                "battery_slot": _battery_slot(cw, ch, ta),
                 "photos": entries,
             }
             (d / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
