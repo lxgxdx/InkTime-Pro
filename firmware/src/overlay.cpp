@@ -6,6 +6,7 @@
 
 #include "board.h"
 #include "digits.h"
+#include "digits16.h"
 
 namespace {
 
@@ -68,8 +69,23 @@ void rectOutline(uint8_t* fb, int cw, int ch, int x, int y, int w, int h, int t,
 
 // 把 5×8 点阵按 gw×gh 最近邻放大（非整数倍也能画，笔画会略有粗细差异，
 // 但电量数字本来就小，不做抗锯齿反而更清楚）。
+// 字高 >= 14px 时用 10×16 精细字模（7.09" 上约 19px，5×8 放大后颗粒感明显）；
+// 小屏（7.3" 约 10px）继续用 5×8 —— 那么小的格子塞 16 行反而糊。
 void drawGlyphScaled(uint8_t* fb, int cw, int ch, int x, int y, char c, uint8_t color,
                      int gw, int gh) {
+  if (gh >= 14) {
+    const int idx = glyph16Index(c);
+    if (idx < 0) return;
+    for (int r = 0; r < gh; ++r) {
+      const int sr = r * GLYPH16_H / gh;
+      const uint16_t bits = kGlyphs10x16[idx][sr];
+      for (int b = 0; b < gw; ++b) {
+        const int sb = b * GLYPH16_W / gw;
+        if (bits & (1 << (GLYPH16_W - 1 - sb))) put(fb, cw, ch, x + b, y + r, color);
+      }
+    }
+    return;
+  }
   const int idx = glyphIndex(c);
   if (idx < 0) return;
   for (int r = 0; r < gh; ++r) {

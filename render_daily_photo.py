@@ -260,9 +260,16 @@ def _visual_metrics(font_size: int, kind: str) -> tuple[int, int]:
     return h, top
 
 
-# 电量图标相对「数字字形高」的整体缩放。1.0 = 和日期一样高；用户 2026-10-18 说
-# 那样还是太显眼，改成 0.7 —— 外壳和百分比一起等比缩小，不再追求和文字同高。
-BATTERY_ICON_SCALE = 0.7
+# 电量图标相对「数字字形高」的整体缩放。**按屏分别取值**：7.09" 的像素密度高
+# （1200 宽 / 7.09" ≈ 283 PPI），同样的比例会显得更扎眼，所以缩得更多。
+# 用户 2026-10-18：0.7 还嫌大、嫌颗粒感明显 → 大屏 0.55。
+def _battery_icon_scale(cw: int, ch: int) -> float:
+    short = min(int(cw), int(ch))
+    if short >= 1000:      # 7.09"（1200）/ 12.43"（1208）
+        return 0.55
+    if short >= 700:
+        return 0.62
+    return 0.72            # 7.3"（480）
 
 
 def _battery_group_width(body_h: int, glyph_h: int) -> int:
@@ -278,21 +285,23 @@ def _battery_group_width(body_h: int, glyph_h: int) -> int:
 def _battery_slot(cw: int, ch: int) -> dict:
     """右下角电量槽（固件在这块白底上画图标 + 百分比）。
 
-    - 外壳和百分比**一起**按数字字形高的 0.7 倍缩小（BATTERY_ICON_SCALE）
-    - 竖直居中在数字字形上；槽右边缘贴齐页面右边距
+    - 外壳和百分比**一起**按数字字形高的比例缩小（大屏 0.55、7.3" 0.72）
+    - **底边**和那一行文字的字形底边对齐（用户要求：高度可以不一样，底边要齐）
+    - 槽右边缘贴齐页面右边距
     - 槽宽按 "100%" 的最宽情况算，固件在里面右对齐（见 overlay.cpp）
 
-    2026-10-18：先试过按中文字高（44px）、再试过按数字字高（35px），用户都觉得
-    "太显眼"；最终不再和文字比高度，直接在数字字高基础上等比例缩到 0.7。
+    2026-10-18：依次试过中文字高（44px）、数字字高（35px）、0.7 倍，用户都觉得
+    "太显眼/颗粒感明显"；最终按屏缩放，并且改成底边对齐。
     """
     lm = _layout_metrics(cw, ch)
-    digit_h, digit_top = _visual_metrics(lm["font_meta"], "digit")
-    body_h = max(8, int(round(digit_h * BATTERY_ICON_SCALE)))
+    digit_h, _ = _visual_metrics(lm["font_meta"], "digit")
+    cjk_h, cjk_top = _visual_metrics(lm["font_meta"], "cjk")
+    body_h = max(6, int(round(digit_h * _battery_icon_scale(cw, ch))))
     glyph_h = body_h
     w = _battery_group_width(body_h, glyph_h)
     x = cw - lm["pad_x"] - w
-    # 竖直中心对齐数字字形中心
-    y = lm["meta_top"] + digit_top + (digit_h - body_h) // 2
+    # 底边对齐：图标底部 = 这一行文字（中文）字形底部
+    y = lm["meta_top"] + cjk_top + cjk_h - body_h
     x = max(0, x)
     y = max(0, min(y, ch - body_h))
     return {"x": int(x), "y": int(y), "w": int(w), "h": int(body_h),
