@@ -273,17 +273,19 @@ def _battery_group_width(body_h: int, glyph_h: int) -> int:
 def _battery_slot(cw: int, ch: int) -> dict:
     """右下角电量槽（固件在这块白底上画图标 + 百分比）。
 
-    - 外壳高 = 那一行**中文字**的实际字形高（旁边的「深圳市南山区」）
-    - 百分比高 = 那一行**数字**的实际字形高（左边的「2022.10.17」）
-    - 竖直按中文字形 bbox 对齐；槽右边缘贴齐页面右边距
+    - 外壳高 = **数字字形高**（和左边的「2022年10月17日」一样高）
+    - 百分比高 = 同一个数字字形高
+    - 竖直按数字字形 bbox 对齐；槽右边缘贴齐页面右边距
     - 槽宽按 "100%" 的最宽情况算，固件在里面右对齐（见 overlay.cpp）
+
+    2026-10-18：原来外壳按**中文字高**（7.09" 上 44px），实测偏大，统一改成数字字高（35px）。
     """
     lm = _layout_metrics(cw, ch)
-    body_h, cjk_top = _visual_metrics(lm["font_meta"], "cjk")
-    glyph_h, _ = _visual_metrics(lm["font_meta"], "digit")
+    body_h, digit_top = _visual_metrics(lm["font_meta"], "digit")
+    glyph_h = body_h
     w = _battery_group_width(body_h, glyph_h)
     x = cw - lm["pad_x"] - w
-    y = lm["meta_top"] + cjk_top
+    y = lm["meta_top"] + digit_top
     x = max(0, x)
     y = max(0, min(y, ch - body_h))
     return {"x": int(x), "y": int(y), "w": int(w), "h": int(body_h),
