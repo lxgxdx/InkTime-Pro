@@ -116,6 +116,15 @@ python server.py
 # 浏览器开 http://127.0.0.1:8765/review 看效果
 ```
 
+## 容器图标
+
+`icon/inktime.png`（512×512）。两处用得到：
+
+- **Unraid Docker 页面**：`docker-compose.yml` 里给了
+  `net.unraid.docker.icon=https://raw.githubusercontent.com/lxgxdx/InkTime-Pro/master/icon/inktime.png`
+  （重建容器后生效；不设就是默认灰方块）
+- **网页 favicon**：服务器提供 `/icon.png`（设置页和照片库页都引用了）
+
 ## 部署到 NAS（Unraid / 任意 Compose 主机）
 
 ### 方式 A：从 GitHub 拉镜像（推荐，升级最省事）

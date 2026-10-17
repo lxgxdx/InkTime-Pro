@@ -1201,8 +1201,29 @@ def refresh_cities(conn: sqlite3.Connection, progress_cb=None) -> dict:
     except sqlite3.OperationalError:
         gps_cols = "NULL, NULL"
 
-    rows = cur.execute(
-        f"SELECT path, {gps_cols}, exif_json, exif_city FROM photo_scores").fetchall()
+    # 只处理"有可能上屏"的照片：无意义（截图/收据/杂物）和低于选片阈值的照片
+    # 永远不会被选中出图，给它们调高德纯属浪费额度（用户 2026-10-18 要求）。
+    threshold = float(getattr(cfg, "MEMORY_THRESHOLD", 75.0) or 0.0)
+    try:
+        cur.execute("SELECT is_meaningful FROM photo_scores LIMIT 1")
+        has_meaningful = True
+    except sqlite3.OperationalError:
+        has_meaningful = False      # 很旧的库还没有这一列
+
+    if has_meaningful:
+        rows = cur.execute(
+            f"SELECT path, {gps_cols}, exif_json, exif_city FROM photo_scores "
+            f"WHERE COALESCE(is_meaningful, 1) != 0 AND COALESCE(memory_score, 0) >= ?",
+            (threshold,)).fetchall()
+    else:
+        rows = cur.execute(
+            f"SELECT path, {gps_cols}, exif_json, exif_city FROM photo_scores").fetchall()
+
+    try:
+        total_all = cur.execute("SELECT COUNT(*) FROM photo_scores").fetchone()[0]
+    except Exception:
+        total_all = len(rows)
+    skipped = max(0, total_all - len(rows))
 
     total = len(rows)
     with_gps = updated = 0
@@ -1224,7 +1245,7 @@ def refresh_cities(conn: sqlite3.Connection, progress_cb=None) -> dict:
                     pass      # 进度上报失败不该拖垮重算本身
     conn.commit()
     return {"total": total, "with_gps": with_gps, "updated": updated,
-            "no_gps": total - with_gps}
+            "no_gps": total - with_gps, "skipped": skipped, "threshold": threshold}
 
 
 def open_db(db_path: Path | str | None = None) -> sqlite3.Connection:

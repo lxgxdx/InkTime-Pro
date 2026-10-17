@@ -1420,6 +1420,7 @@ def build_html(rows, page: int, page_size: int, total_count: int):
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/icon.png">
   <title>InkTime照片数据库</title>
   <style>
     :root{{
@@ -3000,6 +3001,14 @@ def api_save_settings():
     # 若缺 palette/bin_format 则从当前 config 的对应屏补齐，避免切屏后退化四色/错误打包。
     payload = _fill_missing_screen_fields(payload)
 
+    # 高德 Key 变了且非空 → 保存后自动开始重算地名（用户 2026-10-18 要求"保存即生效"）。
+    # 只在新填/换 Key 时触发；重复保存同一个 Key 不会重跑。
+    try:
+        old_key = str(((web_settings.load().get("geocode") or {}).get("amap_key")) or "").strip()
+    except Exception:
+        old_key = ""
+    new_key = str(((payload.get("geocode") or {}).get("amap_key")) or "").strip()
+
     web_settings.save(payload)
     try:
         web_settings.apply_to_config(cfg)
@@ -3013,7 +3022,18 @@ def api_save_settings():
         scheduler.reload_from_settings()
     except Exception as e:
         print(f"[settings] scheduler reload 失败：{e}")
-    return Response(json.dumps({"ok": True}), mimetype="application/json")
+
+    cities_started = False
+    if new_key and new_key != old_key:
+        try:
+            ok, msg = scheduler.start_cities_manual()
+            cities_started = bool(ok)
+            print(f"[settings] 高德 Key 变更，自动重算地名：{msg}")
+        except Exception as e:
+            print(f"[settings] 自动重算地名失败：{e}")
+
+    return Response(json.dumps({"ok": True, "cities_started": cities_started},
+                               ensure_ascii=False), mimetype="application/json")
 
 
 @app.get("/api/status")
@@ -3081,6 +3101,15 @@ def api_cities_start():
     _require_webui_enabled()
     ok, msg = scheduler.start_cities_manual()
     return Response(json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False), mimetype="application/json")
+
+
+@app.get("/icon.png")
+def icon_png():
+    """容器 / 网页图标（Unraid label 指向 GitHub raw，这里给内网一份兜底）。"""
+    p = ROOT_DIR / "icon" / "inktime.png"
+    if not p.is_file():
+        abort(404)
+    return send_file(p, mimetype="image/png", max_age=86400)
 
 
 @app.get("/api/geocode/status")
@@ -3280,6 +3309,7 @@ def build_settings_html() -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="/icon.png">
 <title>InkTime 设置</title>
 <style>
 :root{
@@ -3587,7 +3617,7 @@ details.fold summary + *{margin-top:0}
 </span></div>
 <div class="q-note" id="dedupe_note" style="display:none"></div>
 <div class="q-note" id="cities_note" style="display:none"></div>
-<div class="q-note" style="opacity:.7">「重建去重索引」首次全量要读遍相册里的每个文件，大相册可能要几十分钟；之后是增量，很快。<br>「刷新拍摄地点」只按库里已有的 GPS 坐标重算地名，几秒钟，不必重扫相册、不消耗额度。</div>
+<div class="q-note" style="opacity:.7">「重建去重索引」首次全量要读遍相册里的每个文件，大相册可能要几十分钟；之后是增量，很快。<br>「刷新拍摄地点」只给**会出现在相框里**的照片解析地名（跳过无意义和低于选片阈值的照片），按约 1km 网格缓存，不重扫相册、不消耗大模型额度；用高德时按设置页的「调用间隔」慢慢跑。</div>
 <div id="maintProgressBox" style="display:none;margin:10px 0;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px;">
   <div class="quota-row"><span class="q-label" id="maintStage">准备中…</span><div class="bar"><div class="bar-fill" id="maintFill" style="width:0%"></div></div><span class="q-pct" id="maintPct">0%</span></div>
   <div class="q-note" id="maintDetail"></div>
@@ -3854,7 +3884,14 @@ async function saveSettings(){
   };
   try{
     const r = await getJSON('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
-    document.getElementById('saveMsg').textContent = r.ok ? '已保存 ✓' : '保存失败: '+(r.error||'');
+    const sm = document.getElementById('saveMsg');
+    if(r.ok){
+      sm.textContent = r.cities_started
+        ? '已保存 ✓ 高德 Key 已生效，正在后台重算地名（可在「刷新拍摄地点」看进度）'
+        : '已保存 ✓';
+    }else{
+      sm.textContent = '保存失败: ' + (r.error || '');
+    }
   }catch(e){ document.getElementById('saveMsg').textContent='保存失败: '+e; }
 }
 
@@ -4028,9 +4065,10 @@ const MAINT = {
     name: '刷新拍摄地点',
     url: '/api/cities/progress', start: '/api/cities/start', note: 'cities_note',
     stages: {},
-    result: (s, when, dur) => '✅ 上次刷新' + when + '：库内 ' + (s.total || 0)
+    result: (s, when, dur) => '✅ 上次刷新' + when + '：参与解析 ' + (s.total || 0)
       + ' 张，其中有坐标 ' + (s.with_gps || 0) + ' 张；地名更新 ' + (s.updated || 0)
       + ' 张、用时 ' + dur
+      + (s.skipped ? ('；跳过 ' + s.skipped + ' 张（无意义或低于 ' + (s.threshold || '?') + ' 分，不会上屏）') : '')
       + (s.no_gps ? ('（另有 ' + s.no_gps + ' 张照片没有 GPS 坐标，无法判断地点）') : ''),
   },
 };

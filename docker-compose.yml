@@ -27,6 +27,9 @@ services:
     # 若想本地构建（不拉远程镜像），把上面 image 改成 inktime:latest 并给 build 加注释即可
     container_name: inktime
     restart: unless-stopped
+    # Unraid 的 Docker 页面会读这个 label 当容器图标（不设就是默认的灰色方块）
+    labels:
+      - net.unraid.docker.icon=https://raw.githubusercontent.com/lxgxdx/InkTime-Pro/master/icon/inktime.png
 
     # 端口：server.py 的 Flask（ESP32 下载 .bin + WebUI）
     ports:
