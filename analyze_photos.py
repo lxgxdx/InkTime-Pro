@@ -1227,25 +1227,46 @@ def refresh_cities(conn: sqlite3.Connection, progress_cb=None) -> dict:
 
     total = len(rows)
     with_gps = updated = 0
+    last_report = 0.0
+
+    def _report(i: int, name: str, force: bool = False) -> None:
+        """进度最多每 1.5 秒写一次 —— 高德按 1 秒/次慢慢跑，200 行一报会长时间卡在 0%。"""
+        nonlocal last_report
+        if not progress_cb:
+            return
+        now = time.time()
+        if not force and now - last_report < 1.5:
+            return
+        last_report = now
+        label = f"重算拍摄地点 · {name}" if name else "重算拍摄地点"
+        try:
+            progress_cb(i, total, label)
+        except Exception:
+            pass          # 进度上报失败不该拖垮重算本身
+
     for i, (path, lat, lon, exif_json, old) in enumerate(rows, 1):
+        current = ""
         if lat is None or lon is None:
             lat, lon = _gps_from_exif_json(exif_json)
         if lat is not None and lon is not None:
             with_gps += 1
             new = resolve(lat, lon)
+            current = new
             if new != (old or ""):
                 cur.execute("UPDATE photo_scores SET exif_city = ? WHERE path = ?",
                             (new, path))
                 updated += 1
-        if i % 200 == 0 or i == total:
-            if progress_cb:
-                try:
-                    progress_cb(i, total, "重算拍摄地点")
-                except Exception:
-                    pass      # 进度上报失败不该拖垮重算本身
+        _report(i, current, force=(i == total))
     conn.commit()
-    return {"total": total, "with_gps": with_gps, "updated": updated,
-            "no_gps": total - with_gps, "skipped": skipped, "threshold": threshold}
+
+    out = {"total": total, "with_gps": with_gps, "updated": updated,
+           "no_gps": total - with_gps, "skipped": skipped, "threshold": threshold}
+    try:
+        import geocode
+        out["geocode"] = geocode.get_stats()
+    except Exception:
+        pass
+    return out
 
 
 def open_db(db_path: Path | str | None = None) -> sqlite3.Connection:

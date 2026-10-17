@@ -58,6 +58,13 @@ _lock = threading.Lock()
 _last_call = 0.0
 _api_disabled_reason = ""   # 非空 = 本次进程内不再调用 API（key 无效 / 超额 / 网络不通）
 
+# 本次进程的调用统计（给「刷新拍摄地点」的结果摘要看）
+_STATS = {"calls": 0, "cache_hits": 0, "failed": 0, "no_key": 0}
+
+
+def get_stats() -> dict:
+    return dict(_STATS)
+
 
 def _cache_path() -> Path:
     """缓存文件位置：跟着 photos.db 走，Docker 里就是 /app/data/geo_cache.json。"""
@@ -225,6 +232,7 @@ def _amap_lookup(lat: float, lon: float, key: str) -> tuple[Optional[str], str]:
     )
     try:
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as r:
+            _STATS["calls"] += 1
             data = json.loads(r.read().decode("utf-8", "replace"))
     except Exception as e:
         return None, f"network:{e}"
@@ -263,6 +271,7 @@ def reverse_geocode(lat: Optional[float], lon: Optional[float]) -> str:
 
     key = _amap_key()
     if not key:
+        _STATS["no_key"] += 1
         return ""
 
     ck = _cell_key(lat, lon)
@@ -272,6 +281,7 @@ def reverse_geocode(lat: Optional[float], lon: Optional[float]) -> str:
         name = hit.get("name")
         if isinstance(name, str):
             if name:
+                _STATS["cache_hits"] += 1
                 return name
             # 空结果只在 TTL 内有效（也许高德后来补了数据）
             try:
@@ -287,6 +297,8 @@ def reverse_geocode(lat: Optional[float], lon: Optional[float]) -> str:
     name, reason = _amap_lookup(lat, lon, key)
     if name is None:
         # 失败（网络/超额/国外）：不写缓存，交给本地库兜底
+        if not reason.startswith("outside-cn"):
+            _STATS["failed"] += 1
         return ""
 
     cache[ck] = {"name": name, "at": datetime.now().isoformat(timespec="seconds")}

@@ -4069,6 +4069,9 @@ const MAINT = {
       + ' 张，其中有坐标 ' + (s.with_gps || 0) + ' 张；地名更新 ' + (s.updated || 0)
       + ' 张、用时 ' + dur
       + (s.skipped ? ('；跳过 ' + s.skipped + ' 张（无意义或低于 ' + (s.threshold || '?') + ' 分，不会上屏）') : '')
+      + (s.geocode && s.geocode.calls
+          ? ('；调用高德 ' + s.geocode.calls + ' 次（缓存命中 ' + (s.geocode.cache_hits || 0) + '）')
+          : (s.geocode && s.geocode.no_key ? '；未配置高德 Key，只用本地城市库' : ''))
       + (s.no_gps ? ('（另有 ' + s.no_gps + ' 张照片没有 GPS 坐标，无法判断地点）') : ''),
   },
 };
