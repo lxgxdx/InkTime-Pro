@@ -1932,7 +1932,7 @@ def build_html(rows, page: int, page_size: int, total_count: int):
         finally{{ clearTimeout(timer); }}
         if(!online){{
           if(w) w.close();
-          alert('相框现在连不上（多半在深睡）。\\n按一下 SW1 唤醒（或插上充电线），等十几秒再试。');
+          alert('相框的配网页现在打不开。\\n相框可能正在下载/刷屏（约 35 秒），也可能在深睡。\\n等一会儿再试；一直打不开就按一下 SW1 唤醒。');
           return;
         }}
         if(w) w.location.href = base; else window.location.href = base;
@@ -3918,9 +3918,11 @@ async function checkFrameOnline(){
     // no-cors：只要 TCP/HTTP 通了就会 resolve（响应体读不到也没关系）
     await fetch('http://' + __frameIp + '/?ping=' + Date.now(),
                 {mode:'no-cors', cache:'no-store', signal: ctrl.signal});
-    badge.textContent = '在线'; badge.className = 'badge ok';
+    badge.textContent = '配网页可达'; badge.className = 'badge ok';
   }catch(e){
-    badge.textContent = '可能已休眠（按 SW1 唤醒）'; badge.className = 'badge warn';
+    // 注意：这里只说明"配网页现在打不开"，**不代表相框离线** —— 相框在下载/刷图
+    // （约 35 秒）或深睡时本来就不响应 80 端口。离线与否看左边「最后上线」。
+    badge.textContent = '打不开（正在刷图或已休眠）'; badge.className = 'badge warn';
   }finally{ clearTimeout(timer); }
 }
 
@@ -3950,6 +3952,11 @@ async function refreshDevice(){
     const d = await getJSON('/api/device');
     const seen = d.last_seen_at || '';
     seenEl.textContent = seen ? (seen.replace('T',' ') + '（' + agoText(seen) + '）') : '暂无设备接入';
+    // 10 分钟内上报过 = 在线（绿色）。配网页 ping 不通不代表离线，见 checkFrameOnline。
+    try{
+      const ageMin = seen ? (Date.now() - Date.parse(seen)) / 60000 : Infinity;
+      seenEl.style.color = (ageMin < 10) ? 'var(--accent2)' : '';
+    }catch(e){ seenEl.style.color = ''; }
     const bt = d.by_target || {};
     const k = Object.keys(bt)[0];
     document.getElementById('dev_last_file').textContent = k ? (k + ' → ' + bt[k].last_file) : '—';
@@ -3964,7 +3971,7 @@ async function refreshDevice(){
       pbtn.style.opacity = __frameIp ? '' : '.45';
       pbtn.style.pointerEvents = __frameIp ? '' : 'none';
     }
-    checkFrameOnline();
+    // 不自动 ping 配网页：相框刷图时（35 秒）和深睡时都不响应，自动检测只会误报"离线"
 
     // 设备主动上报的状态。固件没上报过时全部留空 —— 拉图功能不受影响。
     const rep = d.report || {};
