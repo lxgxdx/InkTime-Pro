@@ -42,7 +42,12 @@ from typing import Optional
 # 高德逆地理编码：经度在前、纬度在后，小数点后不超过 6 位
 _AMAP_URL = "https://restapi.amap.com/v3/geocode/regeo"
 _HTTP_TIMEOUT = 8          # 秒
-_MIN_INTERVAL = 0.36       # 秒/次 ≈ 2.8 QPS，低于个人开发者 3 QPS 的上限
+# 默认调用间隔（秒/次）。可在设置页「拍摄地点 → 调用间隔」里改。
+# 个人开发者 QPS 上限约 3，但用户这个 Key 还有别的应用在用，所以默认放慢到 1 秒/次：
+# 几千张照片的缓存建起来会跑一两个小时，反正是一次性的后台任务，不影响使用。
+_DEFAULT_MIN_INTERVAL = 1.0
+_MIN_INTERVAL_FLOOR = 0.2
+_MIN_INTERVAL_CEIL = 10.0
 _EMPTY_TTL_DAYS = 180      # "这里查不到地名"也缓存，免得每次都重查
 
 # 中国大陆的大致经纬度范围。范围外的坐标直接交给本地库（高德海外覆盖很差）。
@@ -101,6 +106,25 @@ def _cell_key(lat: float, lon: float) -> str:
 
 
 _KEY_CACHE: Optional[str] = None
+_INTERVAL_CACHE: Optional[float] = None
+
+
+def _min_interval() -> float:
+    """两次高德调用之间至少隔多久（秒）。设置页可改，范围 0.2~10。"""
+    global _INTERVAL_CACHE
+    if _INTERVAL_CACHE is not None:
+        return _INTERVAL_CACHE
+    val = _DEFAULT_MIN_INTERVAL
+    try:
+        import web_settings
+        v = (web_settings.load().get("geocode") or {}).get("interval_sec")
+        if v is not None:
+            val = float(v)
+    except Exception:
+        pass
+    val = max(_MIN_INTERVAL_FLOOR, min(_MIN_INTERVAL_CEIL, val))
+    _INTERVAL_CACHE = val
+    return val
 
 
 def _resolve_key() -> str:
@@ -183,7 +207,7 @@ def _amap_lookup(lat: float, lon: float, key: str) -> tuple[Optional[str], str]:
         return None, "outside-cn"
 
     with _lock:
-        wait = _MIN_INTERVAL - (time.time() - _last_call)
+        wait = _min_interval() - (time.time() - _last_call)
         if wait > 0:
             time.sleep(wait)
         _last_call = time.time()
@@ -275,6 +299,7 @@ def api_status() -> dict:
     key = _resolve_key()
     return {
         "configured": bool(key),
+        "interval_sec": _min_interval(),
         "key_tail": ("***" + key[-4:]) if len(key) >= 4 else "",
         "disabled": _api_disabled_reason,
         "cache_entries": len(_load_cache()),

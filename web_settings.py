@@ -99,6 +99,8 @@ def _default() -> dict:
         # 拍摄地点（逆地理编码）。amap_key 为空时退回本地城市库（只有中文名）。
         "geocode": {
             "amap_key": "",
+            # 两次高德调用的最小间隔（秒）。Key 有别的应用共用时调大，别抢额度/QPS。
+            "interval_sec": 1.0,
         },
         "config": {
             "MEMORY_THRESHOLD": 75.0,

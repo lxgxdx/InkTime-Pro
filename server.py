@@ -3549,6 +3549,8 @@ details.fold summary + *{margin-top:0}
 <summary>📍 拍摄地点（高德逆地理编码）</summary>
 <div class="hint">原来只靠本地城市库：它找的是「最近的地名点」而不是「照片在哪」，最近的点常是几十公里外的村镇；而且全球只有 20% 的点有中文名，命中那 6% 的村镇点就退化成拼音（「Huanghua 27km」）。填一个高德 Web 服务 Key 后改用官方逆地理编码，准确到区县，屏上显示「深圳市南山区」。<b>个人认证开发者免费 5000 次/日</b>；结果按约 1km 网格缓存，几千张照片通常只消耗几百次。</div>
 <div class="kv"><label>高德 Web 服务 Key</label><input type="password" id="amap_key" placeholder="留空则只用本地城市库"><span class="badge" id="geoBadge">未配置</span></div>
+<div class="kv"><label>调用间隔</label><input type="text" id="geocode_interval" placeholder="1.0" style="width:110px"><span class="q-note" style="margin:0">秒/次（0.2~10）</span></div>
+<div class="hint">▲ 这个 Key 如果还有别的应用在用，把间隔调大（比如 2~5 秒/次）就不会跟它们抢 QPS 和日额度。重算地名是一次性的后台任务，慢一点无所谓 —— 按 1 秒/次算，1000 个位置大约 17 分钟跑完，而且同样的坐标不会重复调用。</div>
 <div class="kv"><label>去哪里申请</label><span class="row"><a class="btn ghost" href="https://lbs.amap.com/dev/key/app" target="_blank" rel="noopener">高德开放平台 → 应用管理 ↗</a><span class="q-note" style="margin:0">注册并完成实名认证 → 新建应用 → 添加 Key → 服务平台选「Web服务」。</span></span></div>
 <div class="kv"><label>操作</label><span class="row">
   <button type="button" onclick="refreshCities()">📍 按新 Key 重算全部地名</button>
@@ -3714,6 +3716,7 @@ async function initSettings(){
     // 拍摄地点（高德逆地理编码）
     const g = s.geocode || {};
     setVal('amap_key', g.amap_key);
+    setVal('geocode_interval', (g.interval_sec === undefined ? 1.0 : g.interval_sec));
     refreshGeocodeStatus();
     const sc = s.schedule || {};
     setVal('analyze_cron', sc.analyze_cron); setChk('analyze_enabled', sc.analyze_enabled);
@@ -3823,6 +3826,7 @@ async function saveSettings(){
     screens: window.__screens || [],
     geocode: {
       amap_key: (document.getElementById('amap_key').value || '').trim(),
+      interval_sec: parseFloat(document.getElementById('geocode_interval').value || '1') || 1.0,
     },
     quota: {
       idle_start: document.getElementById('quota_idle_start').value,
@@ -3937,6 +3941,7 @@ async function refreshGeocodeStatus(){
       badge.textContent = '未配置（用本地库）'; badge.className = 'badge';
     }
     const bits = [];
+    if(g.interval_sec) bits.push('间隔 ' + g.interval_sec + ' 秒/次');
     if(g.cache_entries) bits.push('已缓存 ' + g.cache_entries + ' 个位置');
     if(g.disabled) bits.push('⚠ ' + g.disabled);
     if(note) note.textContent = bits.join(' · ');
