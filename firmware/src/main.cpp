@@ -6,7 +6,10 @@
 //
 // 几条来自硬件、不能靠软件绕开的约束：
 //   · 按键在 IO45/47/48，【不是 RTC GPIO】→ 深睡时叫不醒，只在清醒窗口内有效
-//   · 转接板没有 PWR_ON，MT3608 的 EN 也没接 GPIO → 屏永久带电
+//   · v2 起屏供电由 IO12 经高边 P-MOSFET 控制：高=升压开，低/悬空=屏彻底断电。
+//     复位后 GPIO 高阻 + 板上 R19 下拉 = 【上电默认断电】，所以 setup 第一件事
+//     就是 boardPanelPowerOn()，而且必须在任何一次 epdBegin() 之前。
+//     （v1 是把 MT3608 的 EN 直接挂电池上，屏永久带电，从来没管过屏供电。）
 //   · IO45 是 strapping 脚，任何 ESP.restart() 之前必须先 releaseStrappingPins()
 //
 // 串口走原生 USB（板子只引了 IO19/20），platformio.ini 里开了 ARDUINO_USB_CDC_ON_BOOT。
@@ -24,7 +27,9 @@
 #include "board.h"
 #include "config_store.h"
 #include "daily_fetch.h"
+#include "epd709.h"
 #include "epd_display.h"
+#include "led.h"
 #include "net_portal.h"
 #include "overlay.h"
 #include "selftest.h"
@@ -110,7 +115,10 @@ bool connectWiFi(const FrameConfig& cfg, uint32_t timeoutMs) {
   WiFi.onEvent(onWiFiEvent);   // 要在 begin 之前注册，否则收不到断开事件
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(true);
+  // ⚠️ 关掉 modem sleep。开着时射频只在 DTIM 醒来，实测会周期性
+  //    [WiFi] 断开，原因码 200（beacon 超时）—— 1.9MB 的大图下载正好卡在这上面。
+  //    代价：醒着时功耗高一点；深睡时 WiFi 本来就关掉，不影响。
+  WiFi.setSleep(false);
   WiFi.begin(cfg.wifiSsid.c_str(), cfg.wifiPass.c_str());
 
   const uint32_t start = millis();
@@ -206,6 +214,16 @@ uint32_t minutesToNextRefresh(const FrameConfig& cfg) {
   return (uint32_t)delta;
 }
 
+// 按当前电量/充电状态点灯。用在清醒窗口和充电模式：
+//   已充满 → 绿常亮    充电中 → 红常亮    低电（<20%）→ 红常亮    其余 → 全灭
+// 读不到电量计（valid=false）就当正常处理，不误报低电。
+void ledShowBattery(const BatteryState& st) {
+  if (st.full)                                        ledSet(false, true);
+  else if (st.charging)                               ledSet(true, false);
+  else if (st.valid && st.percent < BATT_LOW_PERCENT) ledSet(true, false);
+  else                                                ledAllOff();
+}
+
 // 把当前状态报给服务器（设置页会显示）。失败无所谓，服务器不靠它供图。
 void reportStatus() {
   const BatteryState st = batteryRead();
@@ -232,7 +250,7 @@ bool showIndex(int idx) {
     memcpy(g_work, g_photo, n);
     const BatteryState st = batteryRead();
     drawBatteryOverlay(g_work, g_man.canvasW, g_man.canvasH, g_man.slotX, g_man.slotY,
-                       g_man.slotW, g_man.slotH, st);
+                       g_man.slotW, g_man.slotH, g_man.slotScale, g_man.slotGlyphH, st);
     if (st.valid) {
       Serial.printf("[电量] %d%%  %.2fV%s%s\n", st.percent, st.voltage,
                     st.charging ? "  充电中" : "", st.full ? "  已充满" : "");
@@ -259,7 +277,7 @@ bool redrawBatteryOnly() {
   memcpy(g_work, g_photo, n);
   const BatteryState st = batteryRead();
   drawBatteryOverlay(g_work, g_man.canvasW, g_man.canvasH, g_man.slotX, g_man.slotY,
-                     g_man.slotW, g_man.slotH, st);
+                     g_man.slotW, g_man.slotH, g_man.slotScale, g_man.slotGlyphH, st);
   Serial.printf("[电量] 重绘：%s%d%%  %.2fV%s%s\n", st.valid ? "" : "(无效) ", st.percent,
                 st.voltage, st.charging ? "  充电中" : "", st.full ? "  已充满" : "");
 
@@ -343,6 +361,7 @@ void stayAwake(uint32_t durationMs, uint32_t batteryRedrawMs, bool exitWhenUnplu
   uint32_t lastRedraw = millis();
 
   for (;;) {
+    lanConfigTick();          // 清醒期间处理局域网配置页的请求
     const uint32_t now = millis();
 
     if (exitWhenUnplugged && digitalRead(PIN_CHRG) != LOW) {
@@ -355,19 +374,24 @@ void stayAwake(uint32_t durationMs, uint32_t batteryRedrawMs, bool exitWhenUnplu
       lastRedraw = now;
       redrawBatteryOnly();      // 内部会刷 40 秒，回来时 now 已经变了
       reportStatus();           // 充电中每重绘一次就顺带上报，设置页能看出电量在涨
+      ledShowBattery(batteryRead());   // 电量跨过阈值时把灯跟上（充完转绿等）
       continue;
     }
 
     switch (pollButtons()) {
       case Btn::Next:
         Serial.println("[按键] 换一张");
+        ledSet(false, true);      // 绿常亮 = 正在刷屏（要等 40 秒）
         showNext();
+        ledShowBattery(batteryRead());
         lastRedraw = millis();    // 刚刷过屏，重置充电重绘计时
         break;
       case Btn::Refresh:
         Serial.println("[按键] 重新拉当前图");
+        ledSet(false, true);
         if (showIndex(g_idx)) Serial.println("[按键] 已刷新");
         else Serial.println("[按键] 拉取失败");
+        ledShowBattery(batteryRead());
         lastRedraw = millis();
         break;
       case Btn::Batt: {
@@ -376,6 +400,7 @@ void stayAwake(uint32_t durationMs, uint32_t batteryRedrawMs, bool exitWhenUnplu
                       st.percent, st.voltage, st.charging ? "  充电中" : "",
                       st.full ? "  已充满" : "");
         redrawBatteryOnly();
+        ledShowBattery(st);
         lastRedraw = millis();
         break;
       }
@@ -399,14 +424,24 @@ void goDeepSleepMinutes(uint32_t minutes) {
   pinMode(PIN_BTN_REFRESH, INPUT);
   pinMode(PIN_BTN_BATT, INPUT);
 
-  // 屏相关引脚置为输入下拉，别在睡眠时往外灌电流
+  // 两颗指示灯全灭，然后放开引脚。亮着的话各吃 1.3mA —— 比整机深睡电流的目标
+  // 还大，省下来的电不该被指示灯吃掉。
+  ledAllOff();
+  pinMode(PIN_LED_RED, INPUT);
+  pinMode(PIN_LED_GREEN, INPUT);
+
+  // 屏相关引脚置为输入下拉，别在睡眠时往外灌电流。
+  // PIN_EPD_EN 也在里面 —— 它一低，升压输入就被 Q1 断开，屏彻底断电；这是 v2
+  // 深睡电流能降下来的关键。（板上 R19 另有一路 100k 下拉兜底，不靠内部下拉。）
   const int epdPins[] = {PIN_EPD_BUSY, PIN_EPD_RST, PIN_EPD_DC,
-                         PIN_EPD_CS,   PIN_EPD_SCLK, PIN_EPD_DIN};
+                         PIN_EPD_CS,   PIN_EPD_SCLK, PIN_EPD_DIN,
+                         PIN_EPD_EN};
   for (int p : epdPins) pinMode(p, INPUT_PULLDOWN);
 
   if (g_photo) { free(g_photo); g_photo = nullptr; }
   if (g_work)  { free(g_work);  g_work  = nullptr; }
 
+  lanConfigStop();          // 先把局域网配置页关掉，再关射频
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
   esp_wifi_stop();
@@ -434,6 +469,12 @@ void setup() {
   delay(300);
   Serial.println();
   Serial.println("===== InkTime 相框 (GDEP073E01 / ESP32-S3) =====");
+
+  // 上电最先做的两件事：把屏供电打开（v2 新增的高边开关），再闪一下绿灯表示
+  // "固件活着"。趁早做还有个好处 —— 后面那串诊断正好给升压留够起振时间。
+  ledBegin();
+  boardPanelPowerOn();
+  ledFlashGreen(1);
 
   // 打印【上一次】复位的原因 —— 排查"一连热点板子就重启"时这是最直接的证据，
   // 能把两种完全不同的病根一刀分开：
@@ -469,9 +510,22 @@ void setup() {
   // 注意不判 SW5(IO0)：IO0 上电被拉低会直接进 ROM 下载模式，固件根本跑不到这。
   const bool wantSelfTest = heldAtBoot(PIN_BTN_REFRESH);   // SW3
   const bool wantPortal   = heldAtBoot(PIN_BTN_NEXT);      // SW2
+  const bool want709Test  = heldAtBoot(PIN_BTN_BATT);      // SW4 → 7.09" 屏自检
   pinMode(PIN_BTN_BATT, INPUT);
 
   configLoad(g_cfg);
+  epdSelectPanel(g_cfg.panel.c_str());   // 按配置选驱动 —— 必须在任何 epdBegin() 之前
+
+  // 7.09" (GDEB0709E01) 首次上板自检：按住 SW4 开机。
+  // 只跑驱动 + 色带，不碰服务器，用来验证供电/SPI/双片选/颜色码这条链。
+  if (want709Test) {
+    Serial.println("[BOOT] SW4 按住 → 7.09\" GDEB0709E01 自检（1200x1600 双片选）");
+    epd709Begin();
+    epd709ColorBars();
+    Serial.println("[BOOT] 709 自检完成：左半屏应为 黑/白/黄，右半屏 红/蓝/绿");
+    Serial.println("[BOOT] 若左右对调 → 改 epd709.cpp 里 CS_M/CS_S 的映射");
+    goDeepSleepMinutes(10);
+  }
 
   // 自检【只在按住 SW3 时】跑。
   //
@@ -480,24 +534,30 @@ void setup() {
   // —— 现象就是"一连热点板子就重启、怎么都连不上"，把真正的病根（供电欠压）
   // 掩盖成了一堆假象。调试期间自动流程越少越好。
   if (wantSelfTest) {
-    Serial.println("[BOOT] SW3 按住 → 六色自检");
-    runSelfTest();
+    // SW3 的六色自检是照 7.3" 屏写的（走 GxEPD2 的 CS=IO46）；7.09" 用 SW4
+    if (g_cfg.panel.indexOf("7.09") >= 0) {
+      Serial.println("[BOOT] SW3 六色自检只适用于 7.3\" 屏；7.09\" 请按住 SW4");
+    } else {
+      Serial.println("[BOOT] SW3 按住 → 六色自检");
+      runSelfTest();
+    }
   }
 
   if (wantPortal) {
-    Serial.println("[BOOT] SW2 按住 → 清空配置并重新配网");
-    configClear();
-    g_cfg = FrameConfig{};      // 结构体有 String 成员，重新赋默认值而不是 memset
-    g_cfg.downloadKey = DEFAULT_DOWNLOAD_KEY;
-    g_cfg.tzOffsetHours = 8;
-    g_cfg.refreshHour = 8;
-    g_cfg.chargingRedrawMin = 20;
+    // SW2 按住 = 打开配网页，【保留现有配置】。
+    // 以前这里会 configClear()，但改个屏幕型号/密码就把 WiFi 全清掉太粗暴 ——
+    // 配网页本来就会把当前值回填到表单里，不清也能改。
+    Serial.println("[BOOT] SW2 按住 → 进入配网页（保留现有配置）");
+    ledSet(true, false);        // 红灯常亮 = 在配网等人操作
     netPortalRun(g_cfg, AP_PORTAL_TIMEOUT_MS);
-    // 超时没保存 → 配置仍是空的，下面会再进一次配网
+    // 保存的话 netPortalRun 内部直接重启；走到这里说明是超时返回
+    configLoad(g_cfg);
+    epdSelectPanel(g_cfg.panel.c_str());
   }
 
   if (!g_cfg.valid) {
     Serial.println("[BOOT] 尚未配置 → 进配网模式（不设超时，配好为止）");
+    ledSet(true, false);        // 红灯常亮 = 在配网等人操作
     netPortalRun(g_cfg, 0);
   }
 
@@ -521,18 +581,26 @@ void setup() {
 
   if (!connectWiFi(g_cfg, WIFI_CONNECT_TIMEOUT_MS)) {
     Serial.println("[BOOT] 连不上 WiFi → 进配网让用户改（10 分钟没动静就先去睡）");
+    ledSet(true, false);        // 红灯常亮 = 在配网等人操作
     netPortalRun(g_cfg, AP_PORTAL_TIMEOUT_MS);
     configLoad(g_cfg);          // 配网页可能改过配置
+    epdSelectPanel(g_cfg.panel.c_str());
     if (!connectWiFi(g_cfg, WIFI_CONNECT_TIMEOUT_MS)) {
+      ledFlashRed(3);
       goDeepSleepMinutes(NO_IMAGE_RETRY_MIN);
     }
   }
+
+  // 从这里一路绿灯常亮：对时 → 取图 → 刷屏。刷屏那 40 秒里它是"固件在跑"的
+  // 唯一外部指示 —— v1 排查"屏不亮"时最缺的就是这个（日志全正常、屏是黑的）。
+  ledSet(false, true);
 
   syncTime(g_cfg);
 
   if (!fetchManifest(g_cfg, g_man)) {
     Serial.printf("[BOOT] 拿不到图：%s\n", g_man.err);
     Serial.printf("[BOOT] %u 分钟后重试（不浪费一整天）\n", (unsigned)NO_IMAGE_RETRY_MIN);
+    ledFlashRed(3);
     goDeepSleepMinutes(NO_IMAGE_RETRY_MIN);
   }
 
@@ -540,6 +608,7 @@ void setup() {
   g_photo = (uint8_t*)psramAlloc(n);
   if (!g_photo) {
     Serial.println("[BOOT] 帧缓冲分配失败，无法上屏");
+    ledFlashRed(3);
     goDeepSleepMinutes(NO_IMAGE_RETRY_MIN);
   }
   // 第二块缓冲【按需分配】：只有服务器给了 battery_slot（要画电量图标）时才用得着。
@@ -554,14 +623,22 @@ void setup() {
   // 当天首次：在本方向的图里随机挑一张（服务器一次会渲染好几张）
   const int pick = (g_man.count > 1) ? (int)random(0, g_man.count) : 0;
   Serial.printf("[BOOT] 本方向 %d 张，随机取第 %d 张\n", g_man.count, pick);
-  if (!showIndex(pick)) {
+  if (showIndex(pick)) {
+    ledFlashGreen(2);      // 办成了（闪完两灯都是灭的）
+  } else {
     Serial.println("[BOOT] 上屏失败");
+    ledFlashRed(3);
   }
   reportStatus();
 
   // ---- 刷完了，接下来是清醒/充电 ----
+
+  // 清醒期间开放局域网配置页：手机/电脑在同一个 WiFi 下直接访问 http://<板子IP>/
+  lanConfigBegin(g_cfg);
+
   if (digitalRead(PIN_CHRG) == LOW) {
     Serial.println("[充电] 检测到正在充电 → 充电模式（保持清醒，按间隔重绘电量）");
+    ledShowBattery(batteryRead());   // 充电中红 / 已充满绿
     const uint32_t redrawMs = (uint32_t)g_cfg.chargingRedrawMin * 60UL * 1000UL;
     if (redrawMs == 0) {
       Serial.println("[充电] 配网页里设成了不重绘，仍保持清醒以便按键可用");
@@ -573,6 +650,7 @@ void setup() {
     // 刚拔电，接下来按正常流程睡到下一个刷新点
   } else {
     Serial.println("[运行] 清醒 10 分钟，期间可以按键换图 / 刷新");
+    ledShowBattery(batteryRead());   // 低电红常亮，电量正常则全灭
     stayAwake(AWAKE_WINDOW_MS, 0, /*exitWhenUnplugged=*/false);
   }
 

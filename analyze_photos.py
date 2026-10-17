@@ -1469,8 +1469,8 @@ import csv
 import math
 from typing import Dict, List, Tuple, Optional
 
-# (lat, lon, name_zh, name_en, population, is_city)
-CityRecord = Tuple[float, float, str, str, int, int]
+# (lat, lon, name_zh, name_en, population, is_city, country_code)
+CityRecord = Tuple[float, float, str, str, int, int, str]
 
 _CITY_CACHE_CITIES: List[CityRecord] | None = None
 _CITY_CACHE_GRID: Dict[Tuple[int, int], List[int]] | None = None
@@ -1518,9 +1518,10 @@ def load_world_cities(csv_path: Path) -> Tuple[List[CityRecord], Dict[Tuple[int,
                 is_city = int((row.get("is_city") or "0").strip() or 0)
             except ValueError:
                 is_city = 0
-            cities.append((lat, lon, name_zh, name_en, pop, is_city))
+            country = (row.get("country_code") or "").strip().upper()
+            cities.append((lat, lon, name_zh, name_en, pop, is_city, country))
 
-    for idx, (lat, lon, name_zh, name_en, _pop, _is_city) in enumerate(cities):
+    for idx, (lat, lon, name_zh, name_en, _pop, _is_city, _cc) in enumerate(cities):
         key = grid_key(lat, lon)
         grid_index.setdefault(key, []).append(idx)
 
@@ -1568,30 +1569,64 @@ def find_nearest_city(
         return ("", None)
 
     nearest_idx = min(dists, key=lambda i: dists[i])
-    if cities[nearest_idx][5] == 1:
-        # 最近的点本身就是座正经城市（首都/省会/地级市，见 geonames feature code）
-        # → 直接用。这里不能只看人口：上海的黄浦区有 30 万人，会把「上海」顶掉；
-        # 而澳门作为特别行政区必须用它自己，不能被 8km 外的珠海盖过去。
+    if cities[nearest_idx][5] == 1 and cities[nearest_idx][2]:
+        # 最近的点本身就是座正经城市（首都/省会/地级市，见 geonames feature code），
+        # 而且库里有中文名 → 直接用。这里不能只看人口：上海的黄浦区有 30 万人，
+        # 会把「上海」顶掉；而澳门作为特别行政区必须用它自己，不能被 8km 外的珠海盖过去。
         best_idx = nearest_idx
     else:
-        # 最近的点只是街区/街道办/村镇（cities500 把一座城市拆成大量区/町级点，
-        # 东京市中心最近的点叫「永福」、巴黎市中心是「Paris 04 Hôtel-de-Ville」），
-        # 这时在「最近距离 + 缓冲」范围内挑人口最大的那个，人口并列时优先有中文名。
+        # 最近的点只是街区/街道办/村镇，或者没有中文名（cities500 把一座城市拆成
+        # 大量区/町级点，东京市中心最近的点叫「永福」、巴黎市中心是
+        # 「Paris 04 Hôtel-de-Ville」）→ 在「最近距离 + 缓冲」范围内重挑：
+        # 有中文名优先，其次人口，最后距离。
         near = [i for i, d in dists.items()
                 if d <= min(best_dist + CITY_NEAR_BUFFER_KM, max_km)]
-        best_idx = max(near, key=lambda i: (cities[i][4], 1 if cities[i][2] else 0, -dists[i]))
+        best_idx = max(near, key=lambda i: (1 if cities[i][2] else 0,
+                                            cities[i][4], -dists[i]))
 
-    name_zh, name_en = cities[best_idx][2], cities[best_idx][3]
-    return (name_zh or name_en or "", dists[best_idx])
+    name_zh, name_en, country = cities[best_idx][2], cities[best_idx][3], cities[best_idx][6]
+    if name_zh:
+        return (name_zh, dists[best_idx])
+    # 国内地点没有中文名时**宁可不显示**，也不要把拼音甩到屏上（"Huanghua 27km"
+    # 看着像 bug，2026-10-17 用户明确要求）。国外地点保留英文名（Paris / Tokyo）。
+    if country == "CN":
+        return ("", dists[best_idx])
+    return (name_en or "", dists[best_idx])
 
 def get_city_resolver():
+    """返回 resolve(lat, lon) -> 中文地名。
+
+    两级：
+    1. **高德逆地理编码**（geocode.py）—— 有 Key 时用，准确到区县；
+       结果按 1km 网格缓存，几千张照片只烧几百次额度。
+    2. **本地 world_cities_zh.csv** —— 没 Key / 没网 / 超额时兜底，
+       只出中文名，不出拼音（详见 find_nearest_city）。
+
+    两样都拿不到时返回 ""，渲染时**整块地点不画**，不留经纬度那种"看着像 bug"的东西。
+    """
     global _CITY_CACHE_CITIES, _CITY_CACHE_GRID
     if _CITY_CACHE_CITIES is None or _CITY_CACHE_GRID is None:
         _CITY_CACHE_CITIES, _CITY_CACHE_GRID = load_world_cities(WORLD_CITIES_CSV)
 
+    try:
+        import geocode
+    except Exception as e:      # geocode.py 缺失也不该拖垮扫描
+        print(f"[地名] geocode 模块不可用，仅用本地城市库：{e}")
+        geocode = None
+
     def resolve(lat: float | None, lon: float | None) -> str:
         if lat is None or lon is None:
             return ""
+
+        if geocode is not None:
+            try:
+                api_name = geocode.reverse_geocode(lat, lon)
+            except Exception as e:
+                print(f"[地名] 高德查询异常，改用本地库：{e}")
+                api_name = ""
+            if api_name:
+                return api_name
+
         name, km = find_nearest_city(lat, lon, _CITY_CACHE_CITIES, _CITY_CACHE_GRID,
                                      max_km=CITY_MAX_DISTANCE_KM)
         if not name:

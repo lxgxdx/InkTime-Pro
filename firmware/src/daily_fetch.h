@@ -12,6 +12,8 @@ struct DailyManifest {
   int     canvasW, canvasH;
   int     count;            // 【该方向实际张数】，不保证是 5，序号 0..count-1 连续
   int     slotX, slotY, slotW, slotH;   // 电量图标槽（服务器留的白底区）
+  int     slotScale = 1;                // 图标放大倍数（服务器按画布短边算好，缺省 1）
+  int     slotGlyphH = 0;               // 百分比数字的字形高（0 = 跟槽高一样）
   String  stamp;            // generated_at。"换一张"后靠它判断新图是否真的渲染好了
   char    err[128];
 };

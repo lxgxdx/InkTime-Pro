@@ -2,9 +2,16 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <string.h>
 #include <GxEPD2_7C.h>
 
 #include "board.h"
+#include "epd709.h"
+
+namespace {
+// 当前面板是不是 7.09"（自定义双片选驱动）。读配置后由 epdSelectPanel() 设置。
+bool g_is709 = false;
+}  // namespace
 
 // 页高取面板物理高的 1/4。7C 驱动的页缓冲是 (WIDTH/2)*页高 = 400*120 = 48000 字节，
 // 分 4 页推完，合计 192000 = 800*480/2，即每个像素半字节（4bpp）。
@@ -55,13 +62,27 @@ const char* epdPaletteName(int i) {
   return (i >= 0 && i < PAL_COUNT) ? kNames[i] : "?";
 }
 
+void epdSelectPanel(const char* name) {
+  g_is709 = (name != nullptr) && (strstr(name, "7.09") != nullptr);
+  Serial.printf("[屏] 面板型号 = %s（驱动：%s）\n", (name && *name) ? name : "(未知)",
+                g_is709 ? "709 双片选" : "GxEPD2 7.3\"");
+}
+
 void epdBegin() {
+  if (g_is709) {
+    epd709Begin();
+    return;
+  }
   SPI.end();
   SPI.begin(PIN_EPD_SCLK, -1 /* 屏不回数据，无 MISO */, PIN_EPD_DIN, PIN_EPD_CS);
   epd.init(0, true, 2, false);
 }
 
 void epdShowBuffer(const uint8_t* fb, int w, int h) {
+  if (g_is709) {
+    epd709ShowBuffer(fb, w, h);
+    return;
+  }
   // 面板原生是 800×480 横向 → rotation 0；竖用 480×800 → rotation 1。
   // 这两个值是靠自检模式人工核对方向后才敢定死的（见 README）。
   epd.setRotation((w == PANEL_W && h == PANEL_H) ? 0 : 1);
@@ -115,4 +136,10 @@ void epdShowBuffer(const uint8_t* fb, int w, int h) {
   epd.hibernate();
 }
 
-void epdHibernate() { epd.hibernate(); }
+void epdHibernate() {
+  if (g_is709) {
+    epd709Sleep();
+    return;
+  }
+  epd.hibernate();
+}

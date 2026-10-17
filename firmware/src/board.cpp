@@ -17,6 +17,19 @@ void releaseStrappingPins() {
   // 由内部弱下拉接管，正是启动需要的电平。
 }
 
+void boardPanelPowerOn() {
+  // v2 的屏供电开关：IO12 高 → Q2 拉低 Q1 栅极 → Q1(AO3401A) 导通 → 升压有电。
+  //
+  // ⚠️ 这一句是 v2 相对 v1 唯一"不做就完全没画面"的软件改动。复位后 GPIO 是高阻，
+  //    板上的 R19(100k) 会把它拉到低 —— 默认就是"断电"，所以必须显式拉高。
+  pinMode(PIN_EPD_EN, OUTPUT);
+  digitalWrite(PIN_EPD_EN, HIGH);
+
+  // 等 MT3608 起振 + 转接板自己那颗高压升压稳住。正常流程里 setup 还要跑好几百
+  // 毫秒（诊断、连 WiFi）才碰屏，这点延时只是兜底，防止将来有人把调用提到最前面。
+  delay(50);
+}
+
 void* psramAlloc(size_t n) {
   void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!p) {

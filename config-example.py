@@ -62,6 +62,15 @@ ENABLE_REVIEW_WEBUI = True
 # Docker 里放 /app 根（镜像已 COPY），默认 ./world_cities_zh.csv 直接可读。
 WORLD_CITIES_CSV = os.environ.get("INKTIME_WORLD_CITIES", "./world_cities_zh.csv")
 
+# ========== 拍摄地点（逆地理编码） ==========
+# 本地城市库只有 20% 的点有中文名，找不到就只剩拼音（"Huanghua 27km"）。
+# 填一个高德 Web 服务 Key 之后改用官方逆地理编码：准确到「深圳市南山区」，
+# 按 ~1km 网格缓存，几千张照片通常只消耗几百次额度。
+#   申请：https://lbs.amap.com → 控制台 → 应用管理 → 新建应用 → 添加「Web服务」Key
+#   个人认证开发者免费额度：逆地理编码 5000 次/日（自然日零点重置）
+# 也可以不填这里，直接在设置页「拍摄地点」里填（存 web_settings.json，优先级更高）。
+AMAP_KEY = os.environ.get("AMAP_KEY", "")
+
 # 网格大小（纬度/经度度数）；越大越快但精度略差。1.0 对大多数场景够用。
 CITY_GRID_DEG = 1.0
 

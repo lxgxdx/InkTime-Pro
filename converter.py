@@ -94,6 +94,22 @@ def render_orientation(img: Image.Image) -> str:
     return "landscape" if w > h else "portrait"
 
 
+# ========== 版式尺度（与 render_daily_photo.py 共用，改一处即可） ==========
+# 整套版式以「480 宽的竖屏」为 1 倍基准；文字带高度按画布**短边**等比缩放。
+# 预裁切（本模块）和渲染（render_daily_photo）必须用同一个值，否则缓存的成品
+# 尺寸对不上，每张图都要现场重裁，白费 analyze 阶段的功夫。
+LAYOUT_BASE = 480.0
+BAND_UNIT = 108          # 文字带高度（scale=1）
+
+
+def layout_scale(cw: int, ch: int) -> float:
+    return max(0.8, min(min(int(cw), int(ch)) / LAYOUT_BASE, 4.0))
+
+
+def layout_band_height(cw: int, ch: int) -> int:
+    return max(56, int(round(BAND_UNIT * layout_scale(cw, ch))))
+
+
 def orientation_dims(screen: dict, orient: Optional[str]) -> tuple:
     """返回某方向下的画布尺寸 (canvas_w, canvas_h)。
 
@@ -245,9 +261,10 @@ def generate_converted_for_screens(
         h = int(sc.get("height", 0))
         if w <= 0 or h <= 0:
             continue
-        # 成品图裁到"照片显示区"（画布减去底部文字区）：按该照片方向对调宽高
-        ta = int(sc.get("text_area_height", 100))
+        # 成品图裁到"照片显示区"（画布减去底部文字带）：按该照片方向对调宽高。
+        # 文字带高度由画布短边推导，不再读 config 的 text_area_height（2026-10-17）。
         dim_w, dim_h = orientation_dims(sc, orient)
+        ta = layout_band_height(dim_w, dim_h)
         img_area_h = max(1, dim_h - ta)
 
         eff_screen = dict(sc)
@@ -295,10 +312,16 @@ def load_converted_or_crop(
             eff_screen["orientation"] = orient
             fp = photo_fingerprint(photo_path, eff_screen)
             cache_path = converted_dir / name / orient / f"{fp}.jpg"
+            # 版式改过（文字带高度变了）时，旧缓存尺寸会对不上 —— 必须重裁并覆盖，
+            # 否则每张图都要在 render_image 里现场重裁，缓存等于作废。
+            exp_w, exp_h = orientation_dims(screen, orient)
+            exp_h = max(1, exp_h - layout_band_height(exp_w, exp_h))
             if cache_path.exists():
                 cached = Image.open(cache_path)
                 cached = cached.convert("RGB")
-                return cached, cache_path
+                if cached.size == (exp_w, exp_h):
+                    return cached, cache_path
+                print(f"[裁切] 缓存尺寸 {cached.size} ≠ 期望 {(exp_w, exp_h)}，重裁并覆盖：{cache_path.name}")
     except Exception:
         pass
 

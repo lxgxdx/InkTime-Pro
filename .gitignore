@@ -3,6 +3,7 @@ config.py
 .env
 photos.db
 filelist.txt
+geo_cache.json
 web_settings.json
 web_settings.json.tmp
 test/

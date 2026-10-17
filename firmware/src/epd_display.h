@@ -2,6 +2,11 @@
 
 #include <stdint.h>
 
+// 选择面板型号（= 服务器 SCREENS 里的 name）。
+// 名字里含 "7.09" → 走 epd709 的双片选驱动；其余走 GxEPD2 的 7.3" 驱动。
+// 必须在任何一次 epdBegin() 之前调用。
+void epdSelectPanel(const char* name);
+
 // 初始化 SPI 与面板（含硬件复位）。可重复调用 —— 面板从 deep sleep 唤醒后
 // GxEPD2 会自己重新走一遍复位时序。
 void epdBegin();

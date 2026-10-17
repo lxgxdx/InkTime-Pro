@@ -1670,6 +1670,7 @@ def build_html(rows, page: int, page_size: int, total_count: int):
       <button type="button" id="randomDateBtn">随机一天</button>
       <button type="button" id="homeBtn">回到首页</button>
       <button type="button" onclick="location.href='/settings'">设置</button>
+      <button type="button" onclick="openFramePortal()">相框配网</button>
       <label style="display:inline-flex;align-items:center;gap:6px"><input type="checkbox" id="showAllToggle" style="width:auto">显示全部（含低分/无意义）</label>
     </div>
 
@@ -1908,6 +1909,38 @@ def build_html(rows, page: int, page_size: int, total_count: int):
         setTimeout(jump, 400);
       }}catch(e){{}}
     }})();
+
+    // 「相框配网」按钮：先【同步】开一个空白页（异步后再 window.open 会被弹窗拦截），
+    // 再去问服务器相框最后上报的 IP。深睡时那个地址连不上，浏览器会报错。
+    async function openFramePortal(){{
+      const w = window.open('', '_blank');
+      try{{
+        const d = await (await fetch('/api/device')).json();
+        if(!d.last_ip){{
+          if(w) w.close();
+          alert('相框还没上报过地址。让它连一次网（按一下 SW1）后再试。');
+          return;
+        }}
+        const base = 'http://' + d.last_ip + '/';
+        // 先探一下通不通：相框深睡时配网页是关着的，直接跳过去只会看到"无法访问"。
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 2500);
+        let online = true;
+        try{{
+          await fetch(base + '?ping=' + Date.now(), {{mode:'no-cors', cache:'no-store', signal: ctrl.signal}});
+        }}catch(e){{ online = false; }}
+        finally{{ clearTimeout(timer); }}
+        if(!online){{
+          if(w) w.close();
+          alert('相框现在连不上（多半在深睡）。\\n按一下 SW1 唤醒（或插上充电线），等十几秒再试。');
+          return;
+        }}
+        if(w) w.location.href = base; else window.location.href = base;
+      }}catch(e){{
+        if(w) w.close();
+        alert('读取相框地址失败：' + e);
+      }}
+    }}
   </script>
 </body>
 </html>
@@ -3050,6 +3083,19 @@ def api_cities_start():
     return Response(json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False), mimetype="application/json")
 
 
+@app.get("/api/geocode/status")
+def api_geocode_status():
+    """拍摄地点解析状态（设置页展示用）：是否配了高德 Key、缓存了多少个网格。"""
+    _require_webui_enabled()
+    try:
+        import geocode
+        return Response(json.dumps(geocode.api_status(), ensure_ascii=False),
+                        mimetype="application/json")
+    except Exception as e:
+        return Response(json.dumps({"configured": False, "error": str(e)}, ensure_ascii=False),
+                        mimetype="application/json")
+
+
 @app.get("/api/device")
 def api_device():
     """相框设备的最后上线 / 拉取记录。
@@ -3236,58 +3282,206 @@ def build_settings_html() -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>InkTime 设置</title>
 <style>
-:root{--bg:#0b0c10;--panel:#16181d;--card:#1d2027;--text:#e6e8ee;--muted:#8a93a3;--line:#2a2e37;--accent:#8ab4ff;--accent2:#9cffd6;--radius:14px;}
+:root{
+  --bg:#08090c; --bg2:#0d0f14;
+  --panel:rgba(255,255,255,.045); --panel-solid:#14161c;
+  --card:rgba(255,255,255,.06); --card-hover:rgba(255,255,255,.10);
+  --text:#eef0f6; --muted:#98a1b3; --muted2:#6f7889;
+  --line:rgba(255,255,255,.10); --line-strong:rgba(255,255,255,.18);
+  --accent:#8ab4ff; --accent2:#7fe3b8; --warn:#ffd479; --err:#ff8080;
+  --radius:16px; --radius-sm:10px;
+  --shadow:0 20px 60px rgba(0,0,0,.45);
+}
 *{box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;margin:0;padding:24px;}
-.container{max-width:920px;margin:0 auto;}
-h1{font-size:22px;margin:0 0 6px;font-weight:600}
-.subtitle{color:var(--muted);font-size:13px;margin-bottom:18px}
+html{scroll-behavior:smooth}
+body{
+  margin:0;padding:0 0 64px;color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',system-ui,'Segoe UI',Roboto,'PingFang SC','Microsoft YaHei',sans-serif;
+  font-size:14px;line-height:1.55;
+  background:
+    radial-gradient(1100px 700px at 12% -8%, rgba(138,180,255,.16), transparent 55%),
+    radial-gradient(900px 640px at 92% 4%, rgba(127,227,184,.10), transparent 55%),
+    linear-gradient(180deg,#06070a 0%, #0a0c11 45%, #08090c 100%);
+  background-attachment:fixed;
+}
+.container{max-width:960px;margin:0 auto;padding:0 20px}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
-.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:20px;padding:12px;background:var(--panel);border-radius:var(--radius);}
-.controls button,input[type=text],input[type=password],select{background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:14px;}
-.controls button{cursor:pointer}
-.controls button:hover{background:var(--line)}
-.controls button.primary{background:var(--accent);color:#0b0c10;font-weight:600;border:none}
-details.fold{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px;margin-bottom:14px;}
-details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;margin-bottom:10px}
-.kv{display:grid;grid-template-columns:180px 1fr auto;gap:10px;align-items:center;margin-bottom:10px;font-size:14px}
-.kv label{color:var(--muted)}
+
+/* —— 顶栏 —— */
+.topbar{
+  position:sticky;top:0;z-index:50;margin:0 0 26px;padding:18px 20px 14px;
+  background:linear-gradient(180deg,rgba(8,9,12,.92),rgba(8,9,12,.72));
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  border-bottom:1px solid var(--line);
+}
+.topbar-inner{max-width:960px;margin:0 auto;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.logo{
+  width:38px;height:38px;border-radius:11px;flex:none;
+  background:linear-gradient(140deg,var(--accent),#6f8fd8 55%,var(--accent2));
+  box-shadow:0 6px 18px rgba(138,180,255,.28);
+  display:grid;place-items:center;font-size:19px;
+}
+h1{font-size:19px;margin:0;font-weight:650;letter-spacing:.2px}
+.subtitle{color:var(--muted);font-size:12.5px;margin:2px 0 0}
+.topbar .actions{margin-left:auto;display:flex;gap:9px;flex-wrap:wrap}
+
+/* —— 按钮 —— */
+button,.btn{
+  display:inline-flex;align-items:center;gap:6px;justify-content:center;
+  background:var(--card);color:var(--text);border:1px solid var(--line-strong);
+  border-radius:11px;padding:9px 15px;font-size:13px;font-weight:500;
+  cursor:pointer;transition:background .15s,border-color .15s,transform .08s;
+  font-family:inherit;white-space:nowrap;
+}
+button:hover,.btn:hover{background:var(--card-hover);border-color:rgba(255,255,255,.28);text-decoration:none}
+button:active,.btn:active{transform:translateY(1px)}
+button.primary,.btn.primary{
+  background:linear-gradient(180deg,#9dc1ff,#7fa9f0);color:#0a0d14;border:none;
+  font-weight:650;box-shadow:0 8px 22px rgba(138,180,255,.25);
+}
+button.primary:hover,.btn.primary:hover{background:linear-gradient(180deg,#b0ccff,#8fb5f5)}
+button.ghost,.btn.ghost{background:transparent}
+button:disabled{opacity:.45;cursor:not-allowed}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+
+/* —— 输入 —— */
+input[type=text],input[type=password],select,textarea{
+  background:rgba(255,255,255,.055);color:var(--text);
+  border:1px solid var(--line-strong);border-radius:10px;padding:9px 12px;
+  font-size:13.5px;font-family:inherit;outline:none;transition:border-color .15s,box-shadow .15s;
+}
+input[type=text]:focus,input[type=password]:focus,select:focus{
+  border-color:rgba(138,180,255,.75);box-shadow:0 0 0 3px rgba(138,180,255,.15);
+}
+input::placeholder{color:var(--muted2)}
+input[type=range]{accent-color:var(--accent)}
+
+/* 开关：所有 checkbox 统一做成拨动开关 */
+input[type=checkbox]{
+  appearance:none;-webkit-appearance:none;width:40px;height:23px;border-radius:12px;
+  background:rgba(255,255,255,.16);border:1px solid var(--line-strong);
+  position:relative;cursor:pointer;transition:background .18s,border-color .18s;flex:none;
+  vertical-align:middle;margin:0;
+}
+input[type=checkbox]::after{
+  content:'';position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;
+  background:#fff;transition:transform .18s;box-shadow:0 1px 3px rgba(0,0,0,.4);
+}
+input[type=checkbox]:checked{background:linear-gradient(180deg,#9dc1ff,#7fa9f0);border-color:transparent}
+input[type=checkbox]:checked::after{transform:translateX(17px)}
+
+.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:14px 0;
+  padding:12px;background:var(--panel);border:1px solid var(--line);border-radius:14px}
+
+/* —— 卡片 / 折叠区 —— */
+details.fold{
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  margin-bottom:14px;overflow:hidden;box-shadow:var(--shadow);
+  padding:0 20px;transition:border-color .2s,background .2s;
+}
+details.fold[open]{background:rgba(255,255,255,.055);border-color:rgba(255,255,255,.14);padding-bottom:18px}
+details.fold summary{
+  cursor:pointer;font-weight:600;font-size:14.5px;outline:none;
+  padding:16px 20px;margin:0 -20px 14px;display:flex;align-items:center;gap:10px;
+  list-style:none;user-select:none;
+}
+details.fold:not([open]) summary{margin-bottom:0}
+details.fold summary::-webkit-details-marker{display:none}
+details.fold summary::after{
+  content:'›';margin-left:auto;color:var(--muted2);font-size:20px;line-height:1;
+  transform:rotate(90deg);transition:transform .2s;
+}
+details.fold[open] summary::after{transform:rotate(-90deg)}
+details.fold summary + *{margin-top:0}
+
+/* —— 表单行 —— */
+.kv{display:grid;grid-template-columns:170px 1fr auto;gap:12px;align-items:center;margin-bottom:12px;font-size:13.5px}
+.kv > label{color:var(--muted);line-height:1.4}
 .kv input[type=text],.kv input[type=password]{width:100%}
-/* cron 常用档位按钮组 */
-.cron-chips{display:flex;flex-wrap:wrap;gap:6px;margin:-4px 0 12px 190px}
-.cron-chips .chip{background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:16px;padding:5px 12px;font-size:12px;cursor:pointer}
-.cron-chips .chip:hover{background:var(--line)}
-.cron-chips .chip.active{background:var(--accent);color:#0b0c10;font-weight:600;border-color:var(--accent)}
-.hint{color:var(--muted);font-size:12px;margin-bottom:14px}
-#quotaBox,.statusline{font-family:ui-monospace,Consolas,monospace;font-size:13px;line-height:1.6;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px;}
-.ok{color:var(--accent2)} .warn{color:#ffd479} .err{color:#ff7b7b}
-/* 额度进度条 */
-.quota-card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px;font-family:system-ui,sans-serif;}
-.quota-title{font-weight:600;font-size:14px;margin-bottom:10px}
-.quota-row{display:flex;align-items:center;gap:10px;margin:8px 0}
-.q-label{width:120px;font-size:12px;color:var(--muted);flex-shrink:0}
-.q-pct{width:60px;text-align:right;font-weight:600;font-size:13px;flex-shrink:0}
-.q-note{font-size:12px;color:var(--muted);margin-top:6px}
-.bar{flex:1;height:12px;background:var(--line);border-radius:6px;overflow:hidden}
-.bar .fill{height:100%;border-radius:6px;transition:width .3s}
-.bar-fill{height:100%;border-radius:6px;background:linear-gradient(90deg,#3fb58a,#54d6a4);transition:width .3s}
-.bar .fill.success{background:linear-gradient(90deg,#3fb58a,#54d6a4)}
+.hint{color:var(--muted2);font-size:12.3px;margin:2px 0 14px;line-height:1.55}
+
+/* cron 常用档位 */
+.cron-chips{display:flex;flex-wrap:wrap;gap:7px;margin:-2px 0 14px 182px}
+.cron-chips .chip{
+  background:rgba(255,255,255,.05);color:var(--muted);border:1px solid var(--line);
+  border-radius:999px;padding:5px 12px;font-size:11.5px;cursor:pointer;transition:.15s;
+}
+.cron-chips .chip:hover{background:var(--card-hover);color:var(--text)}
+.cron-chips .chip.active{background:rgba(138,180,255,.16);color:var(--accent);border-color:rgba(138,180,255,.5)}
+
+/* —— 相框设备信息块 —— */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:4px 0 16px}
+.tile{background:rgba(255,255,255,.045);border:1px solid var(--line);border-radius:12px;padding:12px 14px;min-width:0}
+.tile-k{font-size:11px;color:var(--muted2);letter-spacing:.3px;margin-bottom:4px}
+.tile-v{font-size:14px;font-weight:550;overflow:hidden;text-overflow:ellipsis}
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;padding:3px 9px;border-radius:999px;
+  background:rgba(255,255,255,.07);color:var(--muted);border:1px solid var(--line)}
+.badge.ok{background:rgba(127,227,184,.12);color:var(--accent2);border-color:rgba(127,227,184,.35)}
+.badge.warn{background:rgba(255,212,121,.12);color:var(--warn);border-color:rgba(255,212,121,.35)}
+.badge.err{background:rgba(255,128,128,.12);color:var(--err);border-color:rgba(255,128,128,.35)}
+.dev-actions{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin-top:4px}
+
+/* —— 状态 / 额度 —— */
+#quotaBox,.statusline{
+  font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12.5px;line-height:1.65;
+  background:rgba(0,0,0,.25);border:1px solid var(--line);border-radius:14px;padding:14px 16px;
+  color:var(--muted);
+}
+.ok{color:var(--accent2)} .warn{color:var(--warn)} .err{color:var(--err)}
+.quota-card{background:rgba(255,255,255,.045);border:1px solid var(--line);border-radius:13px;padding:14px 16px;margin-bottom:10px}
+.quota-title{font-weight:600;font-size:13.5px;margin-bottom:10px}
+.quota-row{display:flex;align-items:center;gap:12px;margin:9px 0}
+.q-label{width:126px;font-size:12px;color:var(--muted);flex-shrink:0}
+.q-pct{width:62px;text-align:right;font-weight:600;font-size:12.5px;flex-shrink:0}
+.q-note{font-size:12px;color:var(--muted2);margin-top:6px;line-height:1.6}
+.bar{flex:1;height:9px;background:rgba(255,255,255,.09);border-radius:999px;overflow:hidden}
+.bar .fill,.bar-fill{height:100%;border-radius:999px;transition:width .3s;background:linear-gradient(90deg,#3fb58a,#54d6a4)}
+.bar .fill.success,.bar-fill{background:linear-gradient(90deg,#3fb58a,#54d6a4)}
 .bar .fill.warn{background:linear-gradient(90deg,#e0a83c,#f0c060)}
 .bar .fill.err{background:linear-gradient(90deg,#d65757,#f07b7b)}
+
+/* —— 提示条 —— */
+.toast{
+  position:fixed;left:50%;bottom:28px;transform:translate(-50%,20px);
+  background:rgba(20,22,28,.96);border:1px solid var(--line-strong);color:var(--text);
+  padding:11px 18px;border-radius:12px;font-size:13px;box-shadow:var(--shadow);
+  opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;z-index:100;
+}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+
+@media (max-width:640px){
+  .container{padding:0 14px}
+  .topbar{margin:0 0 18px;padding:14px}
+  .kv{grid-template-columns:1fr;gap:6px}
+  .cron-chips{margin-left:0}
+  .topbar .actions{width:100%;margin-left:0}
+  .topbar .actions .btn,.topbar .actions button{flex:1}
+}
 </style>
 </head>
 <body>
-<div class="container">
-<h1>InkTime 设置</h1>
-<div class="subtitle">修改后点「保存设置」，模型密钥 / 自动任务立即生效（不用重启）。<a href="/review">← 返回照片库</a></div>
-
-<div class="controls">
-  <button type="button" class="primary" onclick="saveSettings()">保存设置</button>
-  <button type="button" onclick="refreshQuota()">查看额度余额</button>
-  <button type="button" onclick="refreshStatus()">查看自动任务</button>
-  <span class="subtitle" id="saveMsg" style="margin:0"></span>
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <div class="logo">🖼️</div>
+      <div>
+        <h1>InkTime 控制台</h1>
+        <div class="subtitle">墨水屏相框 · 照片分析 / 每日出图 / 设备设置</div>
+      </div>
+    </div>
+    <div class="actions">
+      <a class="btn ghost" href="/review">← 照片库</a>
+      <button type="button" onclick="refreshQuota()">额度</button>
+      <button type="button" onclick="refreshStatus()">任务</button>
+      <button type="button" class="primary" onclick="saveSettings()">保存设置</button>
+    </div>
+  </div>
 </div>
+
+<div class="container">
+<div class="subtitle" id="saveMsg" style="margin:-8px 0 16px"></div>
 
 <details class="fold" open>
 <summary>智能模型密钥（MiniMax / 智谱 / DeepSeek）</summary>
@@ -3322,21 +3516,26 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 <div class="statusline" id="statusBox">尚未查看调度状态</div>
 </details>
 
-<details class="fold">
-<summary>相框设备（最后上线 / 换一张）</summary>
-<div class="hint">「最后上线 / 最后拉取 / 累计拉取」来自相框拉图时的被动记录，固件不用做任何事就有；「电量 / 信号」要固件主动上报（InkTime 相框固件已内置），没上报过就是空的。</div>
-<div class="kv"><label>最后上线</label><span id="dev_last_seen" style="grid-column:2/-1">—</span></div>
-<div class="kv"><label>最后拉取</label><span id="dev_last_file" style="grid-column:2/-1">—</span></div>
-<div class="kv"><label>设备地址</label><span id="dev_last_ip" style="grid-column:2/-1">—</span></div>
-<div class="kv"><label>累计拉取</label><span id="dev_pull_count" style="grid-column:2/-1">—</span></div>
-<div class="kv"><label>电量</label><span id="dev_battery" style="grid-column:2/-1">—</span></div>
-<div class="kv"><label>信号</label><span id="dev_rssi" style="grid-column:2/-1">—</span></div>
-<div class="kv"><label>固件</label><span id="dev_fw" style="grid-column:2/-1">—</span></div>
-<div class="kv"><label>操作</label><span style="grid-column:2/-1;display:flex;gap:8px;flex-wrap:wrap">
-<button type="button" onclick="doNext()">🔀 换一张</button>
-<button type="button" onclick="refreshDevice()">刷新状态</button>
-</span></div>
-<div class="q-note" id="dev_note">「换一张」会立刻重选一批照片出图并覆盖 latest.bin（优先排除最近已出过图的照片），相框下次轮询就能看到新图。</div>
+<details class="fold" open>
+<summary>📟 相框设备</summary>
+<div class="hint">「最后上线 / 最后拉取 / 累计拉取」来自相框拉图时的被动记录，固件不用做任何事就有；「电量 / 信号」要固件主动上报（InkTime 固件已内置），没上报过就是空的。</div>
+<div class="tiles">
+  <div class="tile"><div class="tile-k">最后上线</div><div class="tile-v" id="dev_last_seen">—</div></div>
+  <div class="tile"><div class="tile-k">最后拉取</div><div class="tile-v" id="dev_last_file">—</div></div>
+  <div class="tile"><div class="tile-k">设备地址</div><div class="tile-v" id="dev_last_ip">—</div></div>
+  <div class="tile"><div class="tile-k">累计拉取</div><div class="tile-v" id="dev_pull_count">—</div></div>
+  <div class="tile"><div class="tile-k">电量</div><div class="tile-v" id="dev_battery">—</div></div>
+  <div class="tile"><div class="tile-k">信号</div><div class="tile-v" id="dev_rssi">—</div></div>
+  <div class="tile"><div class="tile-k">固件</div><div class="tile-v" id="dev_fw">—</div></div>
+  <div class="tile"><div class="tile-k">配网页</div><div class="tile-v"><span class="badge" id="frameOnline">未检测</span></div></div>
+</div>
+<div class="dev-actions">
+  <a class="btn primary" id="framePortalBtn" href="#" target="_blank" rel="noopener">⚙️ 打开相框配网页 ↗</a>
+  <button type="button" onclick="checkFrameOnline()">检测在线</button>
+  <button type="button" onclick="doNext()">🔀 换一张</button>
+  <button type="button" onclick="refreshDevice()">刷新状态</button>
+</div>
+<div class="q-note" id="dev_note">「打开相框配网页」直接跳转相框自己的设置页（<code>http://相框IP/</code>），不用记网址。<b>相框深睡时配网页是连不上的</b> —— 按一下 SW1 唤醒（或插上充电线）后再点。<br>「换一张」会立刻重选一批照片出图并覆盖 latest.bin（优先排除最近已出过图的照片），相框下次轮询就能看到新图。</div>
 </details>
 
 <details class="fold">
@@ -3344,6 +3543,18 @@ details.fold summary{cursor:pointer;font-weight:600;font-size:15px;outline:none;
 <div class="hint">勾选的屏幕会各自生成对应的图片（尺寸/分辨率不同）。第一个勾选的是主屏。调色板（颜色）与图片打包格式在配置文件里定义，这里只读。</div>
 <div id="screensBox"></div>
 <button type="button" onclick="addScreen()">+ 新增一块屏幕</button>
+</details>
+
+<details class="fold" open>
+<summary>📍 拍摄地点（高德逆地理编码）</summary>
+<div class="hint">原来只靠本地城市库：它找的是「最近的地名点」而不是「照片在哪」，最近的点常是几十公里外的村镇；而且全球只有 20% 的点有中文名，命中那 6% 的村镇点就退化成拼音（「Huanghua 27km」）。填一个高德 Web 服务 Key 后改用官方逆地理编码，准确到区县，屏上显示「深圳市南山区」。<b>个人认证开发者免费 5000 次/日</b>；结果按约 1km 网格缓存，几千张照片通常只消耗几百次。</div>
+<div class="kv"><label>高德 Web 服务 Key</label><input type="password" id="amap_key" placeholder="留空则只用本地城市库"><span class="badge" id="geoBadge">未配置</span></div>
+<div class="kv"><label>去哪里申请</label><span class="row"><a class="btn ghost" href="https://lbs.amap.com/dev/key/app" target="_blank" rel="noopener">高德开放平台 → 应用管理 ↗</a><span class="q-note" style="margin:0">注册并完成实名认证 → 新建应用 → 添加 Key → 服务平台选「Web服务」。</span></span></div>
+<div class="kv"><label>操作</label><span class="row">
+  <button type="button" onclick="refreshCities()">📍 按新 Key 重算全部地名</button>
+  <span class="q-note" id="geoStatus" style="margin:0"></span>
+</span></div>
+<div class="q-note" style="opacity:.75">改完 Key 先点右上角「保存设置」，再点「重算全部地名」。重算只读库里已有的 GPS 坐标，不重扫相册、不消耗大模型额度；同样的坐标不会重复扣额度。</div>
 </details>
 
 <details class="fold">
@@ -3500,6 +3711,10 @@ async function initSettings(){
     setVal('minimax_api_key', m.minimax_api_key); setChk('minimax_enabled', m.minimax_enabled);
     setVal('zhipu_api_key', m.zhipu_api_key);     setChk('zhipu_enabled', m.zhipu_enabled);
     setVal('deepseek_api_key', m.deepseek_api_key); setChk('deepseek_enabled', m.deepseek_enabled);
+    // 拍摄地点（高德逆地理编码）
+    const g = s.geocode || {};
+    setVal('amap_key', g.amap_key);
+    refreshGeocodeStatus();
     const sc = s.schedule || {};
     setVal('analyze_cron', sc.analyze_cron); setChk('analyze_enabled', sc.analyze_enabled);
     setVal('render_cron', sc.render_cron);   setChk('render_enabled', sc.render_enabled);
@@ -3556,22 +3771,23 @@ function renderScreens(){
     div.className = 'kv';
     const en = sc.enabled ? 'checked' : '';
     div.innerHTML =
-      `<label style="display:flex;gap:6px;grid-column:auto"><input type="checkbox" data-idx="${i}" data-field="enabled" ${en}>启用</label>`+
-      `<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">`+
-        `<input type="text" data-idx="${i}" data-field="name" value="${sc.name||''}" title="屏名" style="width:110px">`+
-        `<input type="text" data-idx="${i}" data-field="width" value="${sc.width||''}" title="宽" style="width:70px">x`+
-        `<input type="text" data-idx="${i}" data-field="height" value="${sc.height||''}" title="高" style="width:70px">`+
-        `<input type="text" data-idx="${i}" data-field="text_area_height" value="${sc.text_area_height||''}" title="文字区高" style="width:70px">`+
-        `<button type="button" onclick="removeScreen(${i})">删</button>`+
+      `<label style="display:flex;gap:9px;grid-column:auto"><input type="checkbox" data-idx="${i}" data-field="enabled" ${en}>启用</label>`+
+      `<div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">`+
+        `<input type="text" data-idx="${i}" data-field="name" value="${sc.name||''}" title="屏名（= 服务器 SCREENS 的 name）" style="width:140px">`+
+        `<input type="text" data-idx="${i}" data-field="width" value="${sc.width||''}" title="宽" style="width:82px">`+
+        `<span style="color:var(--muted2)">×</span>`+
+        `<input type="text" data-idx="${i}" data-field="height" value="${sc.height||''}" title="高" style="width:82px">`+
+        `<span class="q-note" style="margin:0">文字区高度按分辨率自动计算</span>`+
+        `<button type="button" onclick="removeScreen(${i})">删除</button>`+
       `</div>`;
     box.appendChild(div);
   });
-  // 绑定 input 同步回 window.__screens
-  box.querySelectorAll('input').forEach(inp => {
-    inp.addEventListener('input', () => {
+  // 绑定 input/select 同步回 window.__screens
+  box.querySelectorAll('input,select').forEach(inp => {
+    inp.addEventListener(inp.tagName === 'SELECT' ? 'change' : 'input', () => {
       const i = +inp.dataset.idx, f = inp.dataset.field, v = inp.value;
       if(f === 'enabled') window.__screens[i][f] = inp.checked;
-      else window.__screens[i][f] = f === 'width'||f==='height'||f==='text_area_height' ? (parseInt(v)||0) : v;
+      else window.__screens[i][f] = (f === 'width' || f === 'height') ? (parseInt(v)||0) : v;
     });
   });
 }
@@ -3605,6 +3821,9 @@ async function saveSettings(){
       dedupe_enabled: document.getElementById('dedupe_enabled').checked,
     },
     screens: window.__screens || [],
+    geocode: {
+      amap_key: (document.getElementById('amap_key').value || '').trim(),
+    },
     quota: {
       idle_start: document.getElementById('quota_idle_start').value,
       idle_end: document.getElementById('quota_idle_end').value,
@@ -3685,6 +3904,45 @@ function agoText(iso){
     return Math.floor(s/86400)+' 天前';
   }catch(e){ return ''; }
 }
+// 相框自己的配网页地址（最后一次上报的 IP）。深睡时它是连不上的。
+let __frameIp = '';
+
+async function checkFrameOnline(){
+  const badge = document.getElementById('frameOnline');
+  if(!badge) return;
+  if(!__frameIp){ badge.textContent = '未上报地址'; badge.className = 'badge'; return; }
+  badge.textContent = '检测中…'; badge.className = 'badge';
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 2500);
+  try{
+    // no-cors：只要 TCP/HTTP 通了就会 resolve（响应体读不到也没关系）
+    await fetch('http://' + __frameIp + '/?ping=' + Date.now(),
+                {mode:'no-cors', cache:'no-store', signal: ctrl.signal});
+    badge.textContent = '在线'; badge.className = 'badge ok';
+  }catch(e){
+    badge.textContent = '可能已休眠（按 SW1 唤醒）'; badge.className = 'badge warn';
+  }finally{ clearTimeout(timer); }
+}
+
+async function refreshGeocodeStatus(){
+  const badge = document.getElementById('geoBadge');
+  const note = document.getElementById('geoStatus');
+  try{
+    const g = await getJSON('/api/geocode/status');
+    if(g.configured){
+      badge.textContent = '已配置 ' + (g.key_tail || ''); badge.className = 'badge ok';
+    } else {
+      badge.textContent = '未配置（用本地库）'; badge.className = 'badge';
+    }
+    const bits = [];
+    if(g.cache_entries) bits.push('已缓存 ' + g.cache_entries + ' 个位置');
+    if(g.disabled) bits.push('⚠ ' + g.disabled);
+    if(note) note.textContent = bits.join(' · ');
+  }catch(e){
+    if(badge){ badge.textContent = '状态查询失败'; badge.className = 'badge err'; }
+  }
+}
+
 async function refreshDevice(){
   const seenEl = document.getElementById('dev_last_seen');
   if(!seenEl) return;
@@ -3697,6 +3955,16 @@ async function refreshDevice(){
     document.getElementById('dev_last_file').textContent = k ? (k + ' → ' + bt[k].last_file) : '—';
     document.getElementById('dev_last_ip').textContent = d.last_ip || '—';
     document.getElementById('dev_pull_count').textContent = (d.pull_count||0) + ' 次';
+
+    // 「打开相框配网页」按钮：地址来自设备最后一次上报
+    __frameIp = d.last_ip || '';
+    const pbtn = document.getElementById('framePortalBtn');
+    if(pbtn){
+      pbtn.href = __frameIp ? ('http://' + __frameIp + '/') : '#';
+      pbtn.style.opacity = __frameIp ? '' : '.45';
+      pbtn.style.pointerEvents = __frameIp ? '' : 'none';
+    }
+    checkFrameOnline();
 
     // 设备主动上报的状态。固件没上报过时全部留空 —— 拉图功能不受影响。
     const rep = d.report || {};

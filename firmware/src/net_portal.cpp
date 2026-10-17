@@ -17,6 +17,10 @@ FrameConfig g_pending;      // 表单提交后暂存，保存完就重启
 // ⚠️ 不能在每次加载页面时扫 —— 见 netPortalRun 里的说明，那样会把 AP 拽掉。
 String g_scanOptions;
 
+// 局域网配网页状态。g_lanMode 只影响页面上的提示文案（局域网下不扫热点）。
+bool g_lanOn = false;
+bool g_lanMode = false;
+
 String htmlEscape(const String& s) {
   String out;
   out.reserve(s.length());
@@ -57,7 +61,11 @@ String buildPage(const FrameConfig& cur) {
   html += htmlEscape(cur.wifiSsid);
   html += F("'>");
   if (g_scanOptions.length() == 0) {
-    html += F("<div class='hint warn'>没扫到任何热点，请手动填写 WiFi 名称。</div>");
+    if (g_lanMode) {
+      html += F("<div class='hint'>局域网模式下不扫描热点，请在输入框里直接填 WiFi 名称。</div>");
+    } else {
+      html += F("<div class='hint warn'>没扫到任何热点，请手动填写 WiFi 名称。</div>");
+    }
   }
   html += F("<div class='hint'>下拉框只负责填输入框，最终以输入框内容为准。</div>");
 
@@ -84,6 +92,25 @@ String buildPage(const FrameConfig& cur) {
   html += F("'>");
   html += F("<div class='hint'>要和服务器 config.py 里的 DOWNLOAD_KEY 一字不差，"
             "写错会拉不到图（服务器返回 404）。</div>");
+
+  html += F("<label>屏幕型号</label><select name='panel'>");
+  {
+    static const char* const ids[2]    = {"GDEP073E01", "7.09_E6"};
+    static const char* const labels[2] = {"7.3 英寸 800×480（GDEP073E01）",
+                                          "7.09 英寸 1200×1600（GDEB0709E01）"};
+    for (int i = 0; i < 2; ++i) {
+      html += F("<option value='");
+      html += ids[i];
+      html += F("'");
+      if (cur.panel == ids[i]) html += F(" selected");
+      html += F(">");
+      html += labels[i];
+      html += F("</option>");
+    }
+  }
+  html += F("</select>");
+  html += F("<div class='hint'>要和服务器设置页里【已启用】的屏幕名一字不差；"
+            "两块屏一次只插一块。</div>");
 
   html += F("<label>每天几点换图</label><select name='hour'>");
   for (int h = 0; h < 24; ++h) {
@@ -152,6 +179,10 @@ void handleSave() {
   c.hostPort    = h;
   if (k.length() > 0) c.downloadKey = k;
 
+  // 只接受这两个已知型号：名字决定用哪套驱动，乱填会让屏直接不显示
+  const String panel = server.arg("panel");
+  if (panel == "GDEP073E01" || panel == "7.09_E6") c.panel = panel;
+
   int tz = server.arg("tz").toInt();
   c.tzOffsetHours = (tz < -12) ? -12 : (tz > 14 ? 14 : tz);
   int hour = server.arg("hour").toInt();
@@ -187,7 +218,45 @@ void handleSave() {
   ESP.restart();
 }
 
+// AP 配网和局域网配网共用同一个 WebServer，路由只注册一次。
+bool g_routesReady = false;
+void ensureRoutes() {
+  if (g_routesReady) return;
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  g_routesReady = true;
+}
+
 }  // namespace
+
+// ── 局域网配网页（WiFi 已连上时用 80 端口提供同一张表单） ──────────────
+
+void lanConfigBegin(const FrameConfig& cur) {
+  if (g_lanOn) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[配置] 没连上 WiFi，局域网配置页不启动");
+    return;
+  }
+  g_lanMode = true;
+  g_pending = cur;
+  ensureRoutes();
+  server.begin();
+  g_lanOn = true;
+  Serial.printf("[配置] 局域网配置页：http://%s/ （清醒期间可用）\n",
+                WiFi.localIP().toString().c_str());
+}
+
+void lanConfigTick() {
+  if (g_lanOn) server.handleClient();
+}
+
+void lanConfigStop() {
+  if (!g_lanOn) return;
+  server.stop();
+  g_lanOn = false;
+  g_lanMode = false;
+  Serial.println("[配置] 局域网配置页已关闭");
+}
 
 // ⚠️⚠️ 临时调试开关，定位完改回 false ⚠️⚠️
 //
@@ -236,8 +305,7 @@ void netPortalRun(const FrameConfig& cur, unsigned long timeoutMs) {
                   ok ? "成功" : "失败", (int)WiFi.channel(),
                   WiFi.softAPIP().toString().c_str());
     g_pending = cur;
-    server.on("/", HTTP_GET, handleRoot);
-    server.on("/save", HTTP_POST, handleSave);
+    ensureRoutes();
     server.begin();
     unsigned long lastBeat = millis();
     for (;;) {
@@ -304,8 +372,7 @@ void netPortalRun(const FrameConfig& cur, unsigned long timeoutMs) {
 
   g_pending = cur;   // 表单默认值用当前配置
 
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/save", HTTP_POST, handleSave);
+  ensureRoutes();
   server.begin();
 
   const unsigned long enterMs = millis();

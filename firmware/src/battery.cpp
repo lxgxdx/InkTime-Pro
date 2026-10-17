@@ -10,6 +10,28 @@
 namespace {
 Adafruit_MAX17048 g_gauge;
 bool g_gaugeOk = false;
+
+bool voltageSane(float v) { return !isnan(v) && v >= 1.0f && v <= 5.0f; }
+
+// 扫描 I2C 总线，把应答的地址打出来。诊断"电量计不应答"时先看这个：
+//   空白      → 总线上根本没器件（U7 没焊好 / 没供电 / SCL·SDA 没连到 U7）
+//   0x36      → MAX17048 在
+//   其它地址  → 芯片型号不对（买到错型号/翻新片）
+void i2cScan() {
+  Serial.println("[I2C] 扫描 0x01~0x7F …");
+  int found = 0;
+  for (uint8_t a = 1; a < 0x7F; ++a) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("[I2C]   应答 0x%02X%s\n", a, (a == 0x36) ? "   ← MAX17048" : "");
+      ++found;
+    }
+  }
+  Serial.printf("[I2C] 共 %d 个器件\n", found);
+  if (found == 0) {
+    Serial.println("[I2C] → 一个都没有：U7 没焊好/没供电，或 SCL/SDA 没连到 U7");
+  }
+}
 }  // namespace
 
 // 位号备忘（排查时别认错）：
@@ -23,24 +45,48 @@ bool batteryBegin() {
   pinMode(PIN_CHRG, INPUT);
   pinMode(PIN_STDBY, INPUT);
 
-  // ⚠️ begin() 返回 true 只代表 I2C 总线起来了，【不代表芯片应答了】——
-  //    实测过：芯片没焊好/不在时 begin() 照样 true，串口里却夹着一行
-  //    requestFrom(): i2cWriteReadNonStop returned Error -1，然后我们还打印"就绪"。
-  //    所以这里多读一次电压做实证：读不出合理值就当没就绪。
+  // begin() 内部做三件事：地址探测（0x36 是否 ACK）、读 IC 版本、软复位。
+  // 返回 true 说明芯片真的应答了。
   g_gaugeOk = g_gauge.begin(&Wire);
-  if (g_gaugeOk) {
-    const float v = g_gauge.cellVoltage();
-    if (isnan(v) || v < 1.0f || v > 5.0f) {
-      Serial.printf("[电量] MAX17048 begin() 成功但读不到电压（读到 %s），当做没就绪\n",
-                    isnan(v) ? "NaN" : "离谱值");
-      Serial.println("[电量] → 查 U7 焊接、I2C（IO8=SCL / IO9=SDA）、以及电池有没有接");
-      g_gaugeOk = false;
-    }
-  }
   if (!g_gaugeOk) {
-    Serial.println("[电量] MAX17048 没应答（没装电池或 I2C 不通），电量将显示 --");
+    Serial.println("[电量] 100kHz 下地址 0x36 没应答 → 扫一下总线");
+    i2cScan();
+  }
+
+  // 不管 begin() 成没成，都从高到低试一遍读电压，找出【最高能跑通】的时钟。
+  // 这是判断总线余量最直接的办法：
+  //   4.7k 上拉（R12/R13）+ 短走线 → 400kHz 都该轻松跑通
+  //   只有 10kHz 能跑            → 总线有漏电 / 虚焊 / 寄生电容
+  static const uint32_t kRates[] = {400000, 200000, 100000, 50000, 25000, 10000};
+  float v = NAN;
+  uint32_t maxRate = 0;
+  for (uint32_t r : kRates) {
+    Wire.setClock(r);
+    const float got = g_gauge.cellVoltage();
+    if (voltageSane(got)) {
+      Serial.printf("[电量]   %6lu Hz → 正常 %.3fV\n", (unsigned long)r, got);
+      v = got;
+      maxRate = r;
+      break;
+    }
+    Serial.printf("[电量]   %6lu Hz → 失败\n", (unsigned long)r);
+  }
+
+  if (maxRate == 0) {
+    g_gaugeOk = false;
+    Serial.println("[电量] 全档位都读不到电压 → 不是速率问题");
+    i2cScan();
   } else {
-    Serial.println("[电量] MAX17048 就绪");
+    g_gaugeOk = true;
+    // 报告能跑的最高档，但【实际运行封顶 100kHz】—— 一次性读成功不等于长期可靠
+    const uint32_t runRate = (maxRate > 100000) ? 100000 : maxRate;
+    Wire.setClock(runRate);
+    Serial.printf("[电量] MAX17048 就绪：最高可跑 %lu Hz，实际用 %lu Hz，当前 %.2fV\n",
+                  (unsigned long)maxRate, (unsigned long)runRate, v);
+    if (maxRate < 100000) {
+      Serial.println("[电量] ⚠ 连 100kHz 都跑不动 —— 4.7k 上拉正常时 400kHz 都没问题，");
+      Serial.println("[电量]    说明总线有漏电/虚焊/寄生电容（先洗板，再复查 R12/R13）");
+    }
   }
   return g_gaugeOk;
 }

@@ -9,6 +9,7 @@ struct FrameConfig {
   String  wifiPass;
   String  hostPort;        // "192.168.88.68:8765"，可带也可不带 http://
   String  downloadKey;     // 与服务器 config.py 的 DOWNLOAD_KEY 一致
+  String  panel;           // 屏幕型号 = 服务器 SCREENS 里的 name（"GDEP073E01" / "7.09_E6"）
   int32_t tzOffsetHours;   // 时区，默认 +8
   uint8_t refreshHour;     // 每天几点拉图，0..23
   uint16_t chargingRedrawMin;  // 充电时每隔多少分钟重绘一次电量；0 = 不重绘

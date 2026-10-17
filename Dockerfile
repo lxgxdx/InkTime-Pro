@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 复制全部应用代码
 # ⚠️ config.py 是用户本机/挂载的带密钥版本，不进镜像、不入库；这里用 .env / volume 注入
 COPY analyze_photos.py render_daily_photo.py server.py \
-     converter.py web_settings.py image_utils.py config-example.py ./
+     converter.py web_settings.py image_utils.py geocode.py config-example.py ./
 
 # 中文城市索引（GPS→城市名，给 VLM 喂"拍摄地点"）。放 /app 根，配 ./world_cities_zh.csv 能直接读到
 COPY world_cities_zh.csv ./world_cities_zh.csv

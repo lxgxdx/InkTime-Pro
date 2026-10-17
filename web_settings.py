@@ -96,6 +96,10 @@ def _default() -> dict:
                 "enabled": False,
             },
         ],
+        # 拍摄地点（逆地理编码）。amap_key 为空时退回本地城市库（只有中文名）。
+        "geocode": {
+            "amap_key": "",
+        },
         "config": {
             "MEMORY_THRESHOLD": 75.0,
             "DAILY_PHOTO_QUANTITY": 5,
@@ -296,7 +300,14 @@ def apply_to_config(cfg) -> None:
             ch["api_key"] = m.get(f"{provider}_api_key", ch.get("api_key", ""))
             ch["enabled"] = bool(m.get(f"{provider}_enabled", ch.get("enabled", True)))
 
-    # 2) 覆盖其它 config 标量
+    # 2) 高德 Key（设置页填的优先于 config.py；空值不覆盖，免得把 config 里的冲掉）
+    geo = s.get("geocode") or {}
+    if isinstance(geo, dict):
+        amap_key = str(geo.get("amap_key") or "").strip()
+        if amap_key:
+            setattr(cfg, "AMAP_KEY", amap_key)
+
+    # 3) 覆盖其它 config 标量
     for k, v in s.get("config", {}).items():
         try:
             setattr(cfg, k, v)

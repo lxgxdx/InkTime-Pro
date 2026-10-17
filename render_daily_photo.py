@@ -22,7 +22,8 @@ from typing import List, Dict, Any, Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import config as cfg
 from image_utils import load_image_any, register_heif
-from converter import crop_with_ai_box, load_converted_or_crop, orientation_dims, render_orientation
+from converter import (crop_with_ai_box, layout_band_height, layout_scale,
+                       load_converted_or_crop, orientation_dims, render_orientation)
 register_heif()
 
 # 渲染子进程启动即应用设置页（改屏/阈值生效），保证 SCREENS 快照拿的是最新值
@@ -162,49 +163,131 @@ def _screen_params(screen: dict, orient: Optional[str] = None) -> tuple:
             否则保持屏幕默认（竖用）。text_area_h 按画布高等比缩放，横摆时条带比例一致。
     """
     screen = dict(screen or {})
-    base_w = int(screen.get("width", 480))
-    base_h = int(screen.get("height", 800))
     canvas_w, canvas_h = orientation_dims(screen, orient)   # landscape→(h,w) 对调
-    cx_h_ratio = canvas_h / 800.0
-    base_ta = float(screen.get("text_area_height", 100 * (base_h / 800.0))) if screen.get("text_area_height") else (100 * (base_h / 800.0))
-    ta = int(round(float(base_ta) * (canvas_h / base_h)))   # 文字区按画布高等比缩放（横摆自动变小，条带比例一致）
+    # 文字带高度由画布短边自动推导（见 _band_height）。config 里的 text_area_height
+    # 从 v11 起只作历史兼容保留，不再参与计算 —— 写死的数字没法同时适配两种分辨率。
+    ta = _band_height(canvas_w, canvas_h)
     pal = [tuple(c) for c in screen.get("palette", [(0, 0, 0), (255, 255, 255), (200, 0, 0), (220, 180, 0)])]
     bfmt = str(screen.get("bin_format", "1byte_per_px"))
     return canvas_w, canvas_h, ta, pal, bfmt
 
 
-# === 电量图标槽（右下角） ===
-# 相框固件会在屏上画一个电池图标 + 百分比。位置由服务器说了算：渲染时在右下角
-# 留出这块白底，同时把坐标写进 manifest.json 的 battery_slot，固件照着画。
-# 这样以后改版式只要动服务器，固件不用重编。
+# === 版式尺度 ===
+# 整套版式以「480 宽的竖屏」为 1 倍基准，所有尺寸都乘同一个 scale ——
+# 这样 480×800 和 1200×1600 上看到的字/留白/图标，**物理比例一致**。
+# 之前字号写死 22/20，7.09"（1200 宽）上只有 1.8% 画宽，看着像蚂蚁（2026-10-17 修）。
 #
-# 尺寸固定、不随方向缩放 —— 固件用的是固定尺寸的 5×8 点阵字模，槽跟着画布缩
-# 数字就塞不下了（文字本来也是固定 22/20 号字，不随画布缩放）。
-BATTERY_SLOT_W = 72
-BATTERY_SLOT_H = 30
-BATTERY_SLOT_GAP = 6      # 槽与左侧地点文字之间的缝
+# scale 取画布**短边** /480：竖用取宽、横用取高。横用时不至于因为画布很宽就把字撑爆。
+PAD_X_UNIT = 22           # 左右留白（scale=1）
+CAPTION_FONT_UNIT = 22    # 文案字号（scale=1）
+META_FONT_UNIT = 18       # 日期/地点字号（scale=1）
+CAPTION_LINE_UNIT = 27    # 文案行高（scale=1）
+
+# 电量图标槽（右下角）。相框固件会在屏上画一个电池图标 + 百分比，这里只留白并
+# 把坐标写进 manifest.json 的 battery_slot。槽高 = 日期字号，固件按槽高推导
+# 整组尺寸（见 _battery_group_width / overlay.cpp）。
 
 
-def _text_band_metrics(cw: int, ch: int, ta: int) -> tuple:
-    """返回 (文字区顶边 y, 第二行 y)。
+def _layout_scale(cw: int, ch: int) -> float:
+    """版式缩放系数（实现在 converter，预裁切和渲染共用同一个值）。"""
+    return layout_scale(cw, ch)
 
-    render_image() 画文字、_battery_slot() 定位图标槽，两边都调它 ——
-    分成两处各算一遍的话，迟早有一边忘了跟着改（crop 列错位就是这么来的）。
+
+def _band_height(cw: int, ch: int) -> int:
+    """文字带高度。只由画布短边决定 —— 与照片方向无关，横竖摆同一块屏观感一致。"""
+    return layout_band_height(cw, ch)
+
+
+def _layout_metrics(cw: int, ch: int) -> dict:
+    """文字带的全部版式参数（一次算清，画文字和定位电量槽都用它）。
+
+    旧版把行高/第二行位置各算一遍，横用时字号没算进去 —— 日期直接被裁出画布。
     """
-    top = ch - ta + max(6, int(round(10 * ch / 800.0)))
-    second = top + max(44, int(round(54 * ch / 800.0)))
-    return top, second
+    s = _layout_scale(cw, ch)
+    band = _band_height(cw, ch)
+    pad_x = max(8, int(round(PAD_X_UNIT * s)))
+    font_caption = max(12, int(round(CAPTION_FONT_UNIT * s)))
+    font_meta = max(10, int(round(META_FONT_UNIT * s)))
+    line_h = max(font_caption + 2, int(round(CAPTION_LINE_UNIT * s)))
+    caption_top = ch - band + max(6, int(round(10 * s)))
+    # 日期/地点行贴底：距画布底边留 12*s 的呼吸位
+    meta_top = ch - max(8, int(round(12 * s))) - font_meta
+    return {
+        "scale": s,
+        "band": band,
+        "band_top": ch - band,
+        "pad_x": pad_x,
+        "font_caption": font_caption,
+        "font_meta": font_meta,
+        "line_h": line_h,
+        "caption_top": caption_top,
+        "meta_top": meta_top,
+    }
 
 
-def _battery_slot(cw: int, ch: int, ta: int) -> dict:
-    """右下角电量槽的画布坐标。与第二行文字同一条水平带，并夹在画布内。"""
-    pad_x = max(8, int(round(24 * cw / 480.0)))
-    _, second_line_y = _text_band_metrics(cw, ch, ta)
-    # 让槽的竖直中心大致落在 20 号字的视觉中心上
-    y = second_line_y + 10 - BATTERY_SLOT_H // 2
-    y = max(0, min(y, ch - BATTERY_SLOT_H))
-    x = max(0, cw - pad_x - BATTERY_SLOT_W)
-    return {"x": int(x), "y": int(y), "w": BATTERY_SLOT_W, "h": BATTERY_SLOT_H}
+# ========== 电量图标槽 ==========
+# 固件按 d = 数字的**实际字形高度**画一个 2:1 的电池外形，里面的 5×8 点阵百分比
+# 也用同样的高度 —— 这样图标和「2022.10.17」看起来一样高。
+#
+# ⚠️ 字号 ≠ 字形高：45px 的字体，数字实际只有约 35px（0.78×）。按字号定槽高
+#    会让电池明显比文字高一截（用户 2026-10-17 指出）。所以这里真的去量 bbox。
+# 这里的公式必须和 firmware/src/overlay.cpp 保持一致（那边是唯一的执行者）。
+
+_VISUAL_METRICS_CACHE: dict[tuple[int, str], tuple[int, int]] = {}
+
+
+def _visual_metrics(font_size: int, kind: str) -> tuple[int, int]:
+    """返回 (字形高, 字形顶相对绘制原点的偏移)，按 (字号, 种类) 缓存。
+
+    kind="cjk" 量中文（"深圳市"），kind="digit" 量数字（"0123456789"）。
+    同一字号下中文比数字高约 20%（45px 字：中文 44、数字 35）—— 电池外壳跟中文
+    对齐、里面的百分比跟数字对齐，整组看起来才和那一行文字一样高。
+    """
+    key = (font_size, kind)
+    if key in _VISUAL_METRICS_CACHE:
+        return _VISUAL_METRICS_CACHE[key]
+    sample = "深圳市" if kind == "cjk" else "0123456789"
+    ratio = 0.95 if kind == "cjk" else 0.78
+    try:
+        probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        bbox = probe.textbbox((0, 0), sample, font=_get_font(font_size))
+        h = max(6, int(bbox[3] - bbox[1]))
+        top = int(bbox[1])
+    except Exception:
+        h = max(6, int(round(font_size * ratio)))
+        top = int(round(font_size * (1 - ratio) * 0.35))
+    _VISUAL_METRICS_CACHE[key] = (h, top)
+    return h, top
+
+
+def _battery_group_width(body_h: int, glyph_h: int) -> int:
+    """图标组（电池 + 凸点 + 缝 + "100%" 四个字）的总宽。"""
+    body_w = 2 * body_h
+    cap_w = max(1, int(round(body_h * 3 / 14)))
+    gap = max(2, int(round(body_h * 4 / 14)))
+    glyph_w = max(3, int(round(glyph_h * 5 / 8)))
+    adv = glyph_w + max(1, int(round(glyph_w / 5)))
+    return body_w + cap_w + gap + 4 * adv
+
+
+def _battery_slot(cw: int, ch: int) -> dict:
+    """右下角电量槽（固件在这块白底上画图标 + 百分比）。
+
+    - 外壳高 = 那一行**中文字**的实际字形高（旁边的「深圳市南山区」）
+    - 百分比高 = 那一行**数字**的实际字形高（左边的「2022.10.17」）
+    - 竖直按中文字形 bbox 对齐；槽右边缘贴齐页面右边距
+    - 槽宽按 "100%" 的最宽情况算，固件在里面右对齐（见 overlay.cpp）
+    """
+    lm = _layout_metrics(cw, ch)
+    body_h, cjk_top = _visual_metrics(lm["font_meta"], "cjk")
+    glyph_h, _ = _visual_metrics(lm["font_meta"], "digit")
+    w = _battery_group_width(body_h, glyph_h)
+    x = cw - lm["pad_x"] - w
+    y = lm["meta_top"] + cjk_top
+    x = max(0, x)
+    y = max(0, min(y, ch - body_h))
+    return {"x": int(x), "y": int(y), "w": int(w), "h": int(body_h),
+            "glyph_h": int(glyph_h), "scale": int(round(lm["scale"]))}
 
 
 def _truncate_to_width(draw, text: str, font, max_w: float) -> str:
@@ -593,13 +676,22 @@ def nearest_palette_color(r: float, g: float, b: float, palette=None) -> Tuple[i
     return best_idx, pr, pg, pb
 
 
+# 行首不能出现的标点（中文排版里叫"避头点"）。贪婪折行最容易把最后一个"。"甩到
+# 第二行单独一行 —— 看着像 bug，实际只是没做避头处理。
+_NO_LINE_START = "。，、；：！？）」』】…·,.;:!?)]}"
+
+
 def wrap_text_chinese(draw: ImageDraw.ImageDraw,
                       text: str,
                       font: ImageFont.FreeTypeFont,
                       max_width: int,
                       max_lines: int) -> List[str]:
-    """
-    简单中文按字符宽度折行。
+    """中文按字符宽度折行。
+
+    v11 加了两条排版规则（用户 2026-10-17 反馈第二行只剩一个「。」太丑）：
+    1. **避头点**：行首不放句读标点；
+    2. **两行时尽量均分**：第二行不足第一行 60% 就重新对半拆，
+       避免「19 个字 + 1 个字」这种失衡。
     """
     if not text:
         return []
@@ -618,12 +710,34 @@ def wrap_text_chinese(draw: ImageDraw.ImageDraw,
                 break
     if line and len(lines) < max_lines:
         lines.append(line)
+
+    # 避头点：某行以标点开头时，把上一行最后一个字挪下来
+    for i in range(1, len(lines)):
+        while lines[i] and lines[i][0] in _NO_LINE_START and len(lines[i - 1]) > 1:
+            lines[i - 1], lines[i] = lines[i - 1][:-1], lines[i - 1][-1] + lines[i]
+
+    # 两行失衡 → 重新对半分（挑"两行都放得下、且宽度最接近"的切点）
+    if len(lines) == 2 and len(lines[1]) < len(lines[0]) * 0.6:
+        best = None
+        for i in range(1, len(text)):
+            if text[i] in _NO_LINE_START:
+                continue
+            a, b = text[:i], text[i:]
+            wa = draw.textlength(a, font=font)
+            wb = draw.textlength(b, font=font)
+            if wa <= max_width and wb <= max_width:
+                score = abs(wa - wb)
+                if best is None or score < best[0]:
+                    best = (score, i)
+        if best:
+            lines = [text[:best[1]], text[best[1]:]]
+
     return lines
 
 
 def format_date_display(date_str: str) -> str:
     """
-    "YYYY-MM-DD" -> "YYYY.M.D"
+    "YYYY-MM-DD" -> "2022年10月17日"（用户 2026-10-17 指定的中文格式，无前导零）
     """
     if not date_str:
         return ""
@@ -636,24 +750,19 @@ def format_date_display(date_str: str) -> str:
         d = str(int(parts[2]))
     except Exception:
         return date_str
-    return f"{y}.{m}.{d}"
+    return f"{y}年{m}月{d}日"
 
 
 def format_location(lat, lon, city: str) -> str:
     """
-    地点字符串：
-    - 有 city 用 city
-    - 否则如果有 lat/lon，用 "lat, lon"（5 位小数）
-    - 否则空字符串（不写“未知地点”）
+    地点字符串：只有拿到像样的地名才显示。
+
+    解析不出地名时**留空**，不再退化成 "22.54310, 114.05787" —— 一串经纬度
+    对看照片的人没有意义，反而很像 bug（2026-10-17 按用户要求改掉）。
     """
     if city and str(city).strip():
         return str(city).strip()
-    if lat is None or lon is None:
-        return ""
-    try:
-        return f"{float(lat):.5f}, {float(lon):.5f}"
-    except Exception:
-        return ""
+    return ""
 
 
 def render_image(item: Dict[str, Any], screen: Optional[Dict[str, Any]] = None) -> Tuple[Image.Image, str]:
@@ -677,8 +786,6 @@ def render_image(item: Dict[str, Any], screen: Optional[Dict[str, Any]] = None) 
     canvas = Image.new("RGB", (cw, ch), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
 
-    img_area_w = cw
-    img_area_h = ch - ta  # 底部留给文字
     eff_screen = dict(screen or SCREEN)
     eff_screen["text_area_height"] = ta
 
@@ -688,57 +795,59 @@ def render_image(item: Dict[str, Any], screen: Optional[Dict[str, Any]] = None) 
         crop = {"x": item.get("crop_x"), "y": item.get("crop_y"),
                 "w": item.get("crop_w"), "h": item.get("crop_h")}
 
+    # ---------- 照片 ----------
+    lm = _layout_metrics(cw, ch)
+    pw, ph = cw, ch - lm["band"]
+
     # 优先用 CONVERTED_DIR 已裁切好的成品基图（analyze 阶段写盘，避免重解码原图）；
-    # 缺失则现裁 + 回填。传入已解码 img，内部按方向取。
+    # 缺失或尺寸对不上则现裁（converter 内部会顺手覆盖旧缓存）。
     img_cropped, _ = load_converted_or_crop(img, str(img_path), crop, eff_screen, CONVERTED_DIR)
-
-    # 稳健性：成品若尺寸不匹配，重新按当前屏裁
-    if img_cropped.size != (img_area_w, img_area_h):
-        img_cropped = crop_with_ai_box(img, crop, img_area_w, img_area_h)
-
-    # 贴到上方
+    if img_cropped.size != (pw, ph):
+        img_cropped = crop_with_ai_box(img, crop, pw, ph)
     canvas.paste(img_cropped, (0, 0))
 
-    # ---------- 底部文字区域（两种方向都放底部横条） ----------
-    padding_x = max(8, int(round(24 * cw / 480.0)))   # 按画布宽等比
-    text_area_top, second_line_y = _text_band_metrics(cw, ch, ta)
-    text_width = cw - 2 * padding_x
-
+    # ---------- 文字区（经典版式：底部白条，文案左对齐，日期左 / 地点右） ----------
     # 字体：FONT_PATH 为空时自动探测容器/本机 CJK 中文字体（否则 load_default 无中文乱码）
-    font_big = _get_font(22)     # 文案
-    font_small = _get_font(20)   # 日期/地点
+    font_big = _get_font(lm["font_caption"])     # 文案
+    font_small = _get_font(lm["font_meta"])      # 日期/地点
+    text_left = lm["pad_x"]
+    text_width = cw - 2 * text_left
+    meta_gap = max(4, int(round(10 * lm["scale"])))   # 文字与电量槽之间的呼吸位
+    slot = _battery_slot(cw, ch)
 
+    # 文案：最多两行
     side_text = item.get("side") or ""
-
-    # 电量图标槽：固件会在右下角这块留白上画电池图标，文字必须绕开它。
-    # 竖用时槽在文案下方、互不干扰；横用时文字带挤，槽会和文案的行区间重叠，
-    # 那时文案也得一起让开槽宽 —— 否则长文案的第二行会顶到图标上。
-    slot = _battery_slot(cw, ch, ta)
-    line_h = max(18, int(round(24 * ch / 800.0)))
-    side_width = text_width
-    if slot["y"] < text_area_top + 2 * line_h:
-        side_width = max(40, text_width - (BATTERY_SLOT_W + BATTERY_SLOT_GAP))
-
-    # 文案：最多两行，从 text_area_top 开始
-    y = text_area_top
+    y = lm["caption_top"]
     if side_text:
-        lines = wrap_text_chinese(draw, side_text, font_big, side_width, max_lines=2)
+        lines = wrap_text_chinese(draw, side_text, font_big, text_width, max_lines=2)
         for line in lines:
-            draw.text((padding_x, y), line, font=font_big, fill=(0, 0, 0))
-            y += line_h  # 行高等比
+            draw.text((text_left, y), line, font=font_big, fill=(0, 0, 0))
+            y += lm["line_h"]
 
-    # 日期 + 地点：固定在底部区域内的第二行
+    # 日期 + 地点合成一行，**整行右对齐**，右端让开电量槽：
+    #   2022年10月17日 深圳市南山区 [电量图标]
     date_display = format_date_display(item["date"])
     loc_display = format_location(item.get("lat"), item.get("lon"), item.get("city") or "")
+    loc_right = slot["x"] - meta_gap
+    meta_max_w = loc_right - text_left
 
-    draw.text((padding_x, second_line_y), date_display, font=font_small, fill=(0, 0, 0))
+    full_text = f"{date_display} {loc_display}".strip()
+    if loc_display and draw.textlength(full_text, font=font_small) > meta_max_w:
+        # 放不下：优先保住日期，把地点截短（截到只剩 1.5 个字宽就干脆不要）
+        date_prefix = (date_display + " ") if date_display else ""
+        date_w = draw.textlength(date_prefix, font=font_small)
+        loc_max_w = meta_max_w - date_w
+        min_loc_w = getattr(font_small, "size", lm["font_meta"]) * 1.5
+        if loc_max_w >= min_loc_w:
+            full_text = date_prefix + _truncate_to_width(draw, loc_display, font_small, loc_max_w)
+        else:
+            full_text = date_display
+    full_text = _truncate_to_width(draw, full_text, font_small, meta_max_w)
 
-    # 地点右对齐，但右端必须让开电量槽（槽区要保持纯白，固件要在上面画图标）
-    loc_right = slot["x"] - BATTERY_SLOT_GAP
-    loc_display = _truncate_to_width(draw, loc_display, font_small, loc_right - padding_x)
-    loc_w = draw.textlength(loc_display, font=font_small)
-    loc_x = max(padding_x, loc_right - loc_w)
-    draw.text((loc_x, second_line_y), loc_display, font=font_small, fill=(0, 0, 0))
+    if full_text:
+        meta_w = draw.textlength(full_text, font=font_small)
+        draw.text((max(text_left, loc_right - meta_w), lm["meta_top"]),
+                  full_text, font=font_small, fill=(0, 0, 0))
 
     return canvas, orient
 
@@ -1108,7 +1217,7 @@ def main(argv=None):
                 "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
                 # 右下角留给固件画电量图标的空白区（画布坐标）。固件照这个坐标画，
                 # 不硬编码 —— 版式改了只要动服务器，固件不用重编。
-                "battery_slot": _battery_slot(cw, ch, ta),
+                "battery_slot": _battery_slot(cw, ch),
                 "photos": entries,
             }
             (d / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

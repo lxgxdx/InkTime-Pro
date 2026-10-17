@@ -58,6 +58,7 @@ void configLoad(FrameConfig& c) {
   c.wifiPass      = getStr("pass", "");
   c.hostPort      = getStr("hostport", "");
   c.downloadKey   = getStr("dlkey", DEFAULT_DOWNLOAD_KEY);
+  c.panel         = getStr("panel", SCREEN_NAME);
   c.tzOffsetHours = getI32("tz", 8);
   c.refreshHour   = getU8("hour", 8);
   c.chargingRedrawMin = getU16("chgmin", 20);
@@ -67,6 +68,7 @@ void configLoad(FrameConfig& c) {
   if (c.refreshHour > 23) c.refreshHour = 8;
   if (c.chargingRedrawMin > 240) c.chargingRedrawMin = 240;
   if (c.downloadKey.length() == 0) c.downloadKey = DEFAULT_DOWNLOAD_KEY;
+  if (c.panel.length() == 0) c.panel = SCREEN_NAME;
 
   c.valid = (c.wifiSsid.length() > 0);
 
@@ -75,12 +77,12 @@ void configLoad(FrameConfig& c) {
   // 指纹（长度 + FNV-1a）是为了回答一个具体问题：**这次保存到底生效了没有？**
   // 排查 WiFi 连不上时，如果每次都只看"已设置"，就分不清"密码改了但还是错的"
   // 和"压根没存进去、还在用旧的"。有了指纹，两次开机的值一比就知道了。
-  Serial.printf("[配置] ssid=%s pass=%s hostport=%s tz=%d hour=%d key=%s valid=%d\n",
+  Serial.printf("[配置] ssid=%s pass=%s hostport=%s panel=%s tz=%d hour=%d key=%s valid=%d\n",
                 c.wifiSsid.c_str(),
                 c.wifiPass.length() ? String("(len=" + String(c.wifiPass.length()) +
                                              ",fp=" + String(passFingerprint(c.wifiPass), HEX) + ")").c_str()
                                     : "(空!)",
-                c.hostPort.c_str(), (int)c.tzOffsetHours, (int)c.refreshHour,
+                c.hostPort.c_str(), c.panel.c_str(), (int)c.tzOffsetHours, (int)c.refreshHour,
                 c.downloadKey.c_str(), (int)c.valid);
 }
 
@@ -90,6 +92,7 @@ void configSave(const FrameConfig& c) {
   prefs.putString("pass", c.wifiPass);
   prefs.putString("hostport", c.hostPort);
   prefs.putString("dlkey", c.downloadKey);
+  prefs.putString("panel", c.panel);
   prefs.putInt("tz", c.tzOffsetHours);
   prefs.putUChar("hour", c.refreshHour);
   prefs.putUShort("chgmin", c.chargingRedrawMin);
